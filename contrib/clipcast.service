@@ -1,0 +1,13 @@
+[Unit]
+Description=clipcast — LAN clipboard sync daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/clipcast run
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
