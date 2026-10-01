@@ -9,4 +9,5 @@
 //! - [`config`], [`cli`], [`paths`]: configuration and entry points
 
 pub mod crypto;
+pub mod engine;
 pub mod proto;
