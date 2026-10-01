@@ -1,0 +1,22 @@
+[package]
+name = "clipcast"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes-gcm = "0.11.1"
+arboard = "3.6.1"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+if-addrs = "0.15.0"
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.0"
+signal-hook = "0.4.4"
+socket2 = "0.6.5"
+thiserror = "2.0.21"
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+wl-clipboard-rs = "0.9.4"
+x11rb = { version = "0.14.0", features = ["xfixes"] }
