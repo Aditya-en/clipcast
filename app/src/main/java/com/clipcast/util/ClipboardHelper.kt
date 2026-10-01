@@ -48,5 +48,25 @@ object ClipboardHelper {
         return text != null && text.isNotEmpty() && text.length <= MAX_TEXT_LENGTH
     }
 
+    /**
+     * Foreground auto-send decision (pure, unit-tested). Sends unless the
+     * text is invalid or repeats what we just sent within [repeatWindowMs].
+     */
+    fun shouldAutoSend(
+        text: String?,
+        lastSentHash: String?,
+        lastSentTimeMs: Long,
+        nowMs: Long,
+        repeatWindowMs: Long = 2000
+    ): Boolean {
+        if (!isValidForSend(text)) return false
+        if (lastSentHash != null && nowMs - lastSentTimeMs < repeatWindowMs &&
+            contentHash(text!!) == lastSentHash
+        ) {
+            return false
+        }
+        return true
+    }
+
     fun getMaxTextLength(): Int = MAX_TEXT_LENGTH
 }

@@ -78,6 +78,7 @@ class SendActivity : AppCompatActivity() {
         val serviceIntent = Intent(this, ClipcastService::class.java).apply {
             action = ClipcastService.ACTION_SEND_CLIPBOARD
             putExtra(ClipcastService.EXTRA_TEXT, text)
+            putExtra(ClipcastService.EXTRA_QUIET, false)
         }
         startService(serviceIntent)
 

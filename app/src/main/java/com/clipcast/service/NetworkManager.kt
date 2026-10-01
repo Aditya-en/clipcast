@@ -64,10 +64,20 @@ class NetworkManager(private val context: Context) {
     fun getCurrentBroadcastAddress(): InetAddress? = currentBroadcastAddress
 
     private fun updateBroadcastAddress(network: Network) {
-        val linkProperties = connectivityManager.getLinkProperties(network)
-        val newAddress = computeBroadcastAddress(linkProperties)
+        // Runs on the ConnectivityThread; never let it throw (would kill the process).
+        // On any failure fall back to the limited broadcast address.
+        val newAddress = try {
+            computeBroadcastAddress(connectivityManager.getLinkProperties(network))
+        } catch (e: Exception) {
+            android.util.Log.w("ClipcastNet", "LinkProperties unavailable, using 255.255.255.255", e)
+            try {
+                InetAddress.getByName("255.255.255.255")
+            } catch (e2: Exception) {
+                null
+            }
+        }
 
-        if (newAddress != currentBroadcastAddress) {
+        if (newAddress != null && newAddress != currentBroadcastAddress) {
             currentBroadcastAddress = newAddress
             listener?.onBroadcastAddressChanged(newAddress)
         }

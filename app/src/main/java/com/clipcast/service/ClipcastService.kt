@@ -34,7 +34,9 @@ class ClipcastService : Service() {
         const val ACTION_START = "com.clipcast.ACTION_START"
         const val ACTION_STOP = "com.clipcast.ACTION_STOP"
         const val ACTION_SEND_CLIPBOARD = "com.clipcast.ACTION_SEND_CLIPBOARD"
+        const val ACTION_QUERY_STATUS = "com.clipcast.ACTION_QUERY_STATUS"
         const val EXTRA_TEXT = "extra_text"
+        const val EXTRA_QUIET = "extra_quiet"
 
         const val BROADCAST_STATUS = "com.clipcast.BROADCAST_STATUS"
         const val EXTRA_STATUS = "extra_status"
@@ -90,10 +92,12 @@ class ClipcastService : Service() {
         when (action) {
             ACTION_START -> startServiceLogic()
             ACTION_STOP -> stopServiceLogic()
+            ACTION_QUERY_STATUS -> broadcastStatus()
             ACTION_SEND_CLIPBOARD -> {
                 val text = intent.getStringExtra(EXTRA_TEXT)
+                val quiet = intent.getBooleanExtra(EXTRA_QUIET, false)
                 if (text != null) {
-                    sendText(text)
+                    sendText(text, quiet)
                 }
             }
         }
@@ -228,10 +232,21 @@ class ClipcastService : Service() {
         broadcastStatus()
     }
 
-    fun sendText(text: String) {
-        if (!isRunning) return
+    fun sendText(text: String, quiet: Boolean = false) {
+        if (!isRunning) {
+            broadcastSendResult(false, text.length, quiet)
+            return
+        }
         if (!ClipboardHelper.isValidForSend(text)) {
-            broadcastSendResult(false, text.length)
+            broadcastSendResult(false, text.length, quiet)
+            return
+        }
+
+        // Echo prevention: never rebroadcast text we just applied from remote.
+        val now = System.currentTimeMillis()
+        val hash = ClipboardHelper.contentHash(text)
+        if (hash == lastAppliedContentHash && now - lastAppliedTime < 1000) {
+            Log.d("ClipcastService", "dropping echo of just-applied remote content")
             return
         }
 
@@ -254,18 +269,19 @@ class ClipcastService : Service() {
                 lastTxTime = System.currentTimeMillis()
                 lastTxLen = payload.size
                 broadcastStatus()
-                broadcastSendResult(true, payload.size)
+                broadcastSendResult(true, payload.size, quiet)
             } catch (e: Exception) {
                 Log.w("ClipcastService", "Send error", e)
-                broadcastSendResult(false, payload.size)
+                broadcastSendResult(false, payload.size, quiet)
             }
         }
     }
 
-    private fun broadcastSendResult(success: Boolean, length: Int) {
+    private fun broadcastSendResult(success: Boolean, length: Int, quiet: Boolean = false) {
         val intent = Intent("com.clipcast.SEND_RESULT")
         intent.putExtra("success", success)
         intent.putExtra("length", length)
+        intent.putExtra(EXTRA_QUIET, quiet)
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
 
