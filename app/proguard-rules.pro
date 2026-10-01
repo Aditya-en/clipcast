@@ -1,0 +1,6 @@
+-keep class com.clipcast.** { *; }
+-keepclassmembers class com.clipcast.** { *; }
+-dontwarn javax.crypto.**
+-dontwarn java.security.**
+-keepattributes Signature
+-keepattributes *Annotation*

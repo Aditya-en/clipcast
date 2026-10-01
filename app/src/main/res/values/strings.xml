@@ -1,0 +1,32 @@
+<resources>
+    <string name="app_name">Clipcast</string>
+    <string name="tile_label">Clipcast Send</string>
+    <string name="pref_key">Encryption Key (base64)</string>
+    <string name="pref_key_summary">32-byte key as base64 from clipcast keygen</string>
+    <string name="pref_port">UDP Port</string>
+    <string name="pref_port_summary">Default 47474</string>
+    <string name="pref_autostart">Autostart on boot</string>
+    <string name="device_id_label">Device ID</string>
+    <string name="status_stopped">Stopped</string>
+    <string name="status_starting">Starting…</string>
+    <string name="status_running">Running on %1$s:%2$d</string>
+    <string name="status_no_wifi">No Wi-Fi</string>
+    <string name="last_rx">Last received: %1$s (%2$d bytes)</string>
+    <string name="last_tx">Last sent: %1$s (%2$d bytes)</string>
+    <string name="never">never</string>
+    <string name="btn_send_now">Send clipboard now</string>
+    <string name="btn_start">Start</string>
+    <string name="btn_stop">Stop</string>
+    <string name="toast_sent">Sent %1$d bytes</string>
+    <string name="toast_sent_fail">Send failed</string>
+    <string name="toast_oversize">Text too large (%1$d bytes, max 1200)</string>
+    <string name="toast_key_invalid">Invalid key: must be 32 bytes base64</string>
+    <string name="toast_service_started">Service started</string>
+    <string name="toast_service_stopped">Service stopped</string>
+    <string name="notification_title">Clipcast sync active</string>
+    <string name="notification_text">Tap to open / Send clipboard</string>
+    <string name="notification_action_send">Send clipboard</string>
+    <string name="notification_channel_id">clipcast_sync</string>
+    <string name="notification_channel_name">Clipcast Sync</string>
+    <string name="notification_channel_desc">Foreground service for LAN clipboard sync</string>
+</resources>
