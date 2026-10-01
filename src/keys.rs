@@ -130,6 +130,63 @@ fn write_device_id(path: &Path, id: &[u8; DEVICE_ID_LEN]) -> Result<(), DeviceId
     })
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum KeygenError {
+    #[error("key file {path} already exists; pass --force to overwrite")]
+    Exists { path: String },
+    #[error("cannot write key file {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Create the key file (mode 0600). Refuses to overwrite an existing key
+/// unless `force` is set.
+pub fn generate_key_file(path: &Path, force: bool) -> Result<KeyBytes, KeygenError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let shown = path.display().to_string();
+    if !force && path.exists() {
+        return Err(KeygenError::Exists { path: shown });
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| KeygenError::Io {
+            path: shown.clone(),
+            source,
+        })?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let key = crypto::generate_key();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|source| KeygenError::Io {
+            path: shown.clone(),
+            source,
+        })?;
+    file.write_all(encoded.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .map_err(|source| KeygenError::Io {
+            path: shown.clone(),
+            source,
+        })?;
+    // Re-assert mode: a pre-existing file keeps its old mode under truncate.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
+        KeygenError::Io {
+            path: shown.clone(),
+            source,
+        }
+    })?;
+    Ok(key)
+}
+
 /// One-line status of the key file for `doctor`.
 pub fn key_status(path: &Path) -> String {
     match read_key(path) {
@@ -219,6 +276,33 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keygen_creates_readable_0600_key() {
+        let dir = temp_key_dir("keygen-create");
+        let path = dir.join("key");
+        let key = generate_key_file(&path, false).unwrap();
+        assert_eq!(read_key(&path).unwrap(), key);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keygen_refuses_overwrite_without_force() {
+        let dir = temp_key_dir("keygen-refuse");
+        let path = dir.join("key");
+        let first = generate_key_file(&path, false).unwrap();
+        let err = generate_key_file(&path, false).unwrap_err();
+        assert!(matches!(err, KeygenError::Exists { .. }), "{err}");
+        assert_eq!(read_key(&path).unwrap(), first, "key unchanged");
+        let second = generate_key_file(&path, true).unwrap();
+        assert_eq!(read_key(&path).unwrap(), second, "force overwrites");
+        assert_ne!(first, second, "fresh key material");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
