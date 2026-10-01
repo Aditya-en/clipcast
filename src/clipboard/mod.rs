@@ -3,8 +3,38 @@
 //! plug in behind `crate::engine::ClipboardBackend`.
 
 use std::fmt;
+use std::io;
+use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
-use crate::config::BackendOverride;
+use crate::config::{BackendOverride, Config};
+use crate::engine::{ClipboardBackend, ClipboardEvent};
+
+mod polling;
+mod wayland;
+mod x11;
+
+/// Fan-out of local clipboard change events to every active subscriber.
+/// Backends own one of these for their lifetime; `subscribe_changes` may be
+/// called any number of times.
+#[derive(Default)]
+pub(crate) struct Subscribers(Mutex<Vec<Sender<ClipboardEvent>>>);
+
+impl Subscribers {
+    pub(crate) fn subscribe(&self) -> Receiver<ClipboardEvent> {
+        let (tx, rx) = channel();
+        if let Ok(mut subs) = self.0.lock() {
+            subs.push(tx);
+        }
+        rx
+    }
+
+    pub(crate) fn emit(&self, event: ClipboardEvent) {
+        if let Ok(mut subs) = self.0.lock() {
+            subs.retain(|s| s.send(event.clone()).is_ok());
+        }
+    }
+}
 
 /// What the environment says about the graphical session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +135,21 @@ impl fmt::Display for BackendPlan {
             BackendPlan::Wayland => "wayland (data-control, event-driven)",
             BackendPlan::Polling => "polling (arboard)",
         })
+    }
+}
+
+impl BackendPlan {
+    /// Instantiate the concrete backend for this plan. Failures (missing
+    /// extension, compositor gone, no display) are returned to the caller,
+    /// which may fall back to [`BackendPlan::Polling`].
+    pub fn create(self, cfg: &Config) -> io::Result<Box<dyn ClipboardBackend>> {
+        match self {
+            BackendPlan::X11 => x11::create(),
+            BackendPlan::Wayland => wayland::create(),
+            BackendPlan::Polling => {
+                polling::create(std::time::Duration::from_millis(cfg.poll_interval_ms))
+            }
+        }
     }
 }
 
@@ -263,5 +308,152 @@ mod tests {
             &DataControlSupport::Supported,
         );
         assert_eq!(plan, BackendPlan::X11);
+    }
+}
+
+// GUI round-trip tests below use the real session clipboard. They are
+// serialized (shared clipboard) and skip when no display is reachable.
+#[cfg(test)]
+mod gui_tests {
+    use super::*;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    static GUI_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_gui() -> std::sync::MutexGuard<'static, ()> {
+        GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn recv_matching(
+        rx: &std::sync::mpsc::Receiver<ClipboardEvent>,
+        timeout: Duration,
+        want: &str,
+    ) -> Option<ClipboardEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            match rx.recv_timeout(remaining) {
+                Ok(ev) if ev.text == want => return Some(ev),
+                Ok(_) => continue,
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+
+    fn copy_text_externally(text: &str, sensitive: bool) -> io::Result<()> {
+        let mut opts = wl_clipboard_rs::copy::Options::new();
+        opts.trim_newline(false);
+        opts.sensitive(sensitive);
+        opts.copy(
+            wl_clipboard_rs::copy::Source::Bytes(text.as_bytes().to_vec().into()),
+            wl_clipboard_rs::copy::MimeType::Text,
+        )
+        .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    #[test]
+    fn wayland_backend_roundtrip() {
+        let _g = lock_gui();
+        let backend = match wayland::create() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping wayland backend roundtrip: {e}");
+                return;
+            }
+        };
+        let rx = backend.subscribe_changes();
+
+        copy_text_externally("clipcast-wl-in", false).expect("external wayland copy");
+        let ev = recv_matching(&rx, Duration::from_secs(5), "clipcast-wl-in")
+            .expect("wayland watcher must observe external copy");
+        assert!(!ev.sensitive);
+
+        while rx.try_recv().is_ok() {}
+        copy_text_externally("clipcast-wl-secret", true).expect("external sensitive copy");
+        let ev = recv_matching(&rx, Duration::from_secs(5), "clipcast-wl-secret")
+            .expect("wayland watcher must observe sensitive copy");
+        assert!(ev.sensitive, "password-manager hint must be detected");
+
+        backend
+            .set_text("clipcast-wl-out")
+            .expect("wayland set_text");
+        assert_eq!(
+            backend.get_text().expect("wayland get_text").as_deref(),
+            Some("clipcast-wl-out")
+        );
+    }
+
+    #[test]
+    fn x11_backend_roundtrip() {
+        let _g = lock_gui();
+        let backend = match x11::create() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping x11 backend roundtrip: {e}");
+                return;
+            }
+        };
+        let rx = backend.subscribe_changes();
+
+        // An independent X11 client takes ownership and serves content; the
+        // backend must see the XFixes notification and read the text.
+        let mut external = match arboard::Clipboard::new() {
+            Ok(cb) => cb,
+            Err(e) => {
+                eprintln!("skipping x11 backend roundtrip: no X display: {e}");
+                return;
+            }
+        };
+        external
+            .set_text("clipcast-x11-in")
+            .expect("external x11 copy");
+        let ev = recv_matching(&rx, Duration::from_secs(5), "clipcast-x11-in")
+            .expect("x11 backend must observe external copy");
+        assert!(!ev.sensitive);
+
+        // Serve path: our set_text must satisfy an independent reader.
+        backend.set_text("clipcast-x11-out").expect("x11 set_text");
+        let mut reader = arboard::Clipboard::new().expect("second X11 client");
+        assert_eq!(
+            reader.get_text().expect("external read"),
+            "clipcast-x11-out"
+        );
+        assert_eq!(
+            backend.get_text().expect("backend get_text").as_deref(),
+            Some("clipcast-x11-out")
+        );
+        drop(external);
+    }
+
+    #[test]
+    fn polling_backend_roundtrip() {
+        let _g = lock_gui();
+        let backend = match polling::create(Duration::from_millis(50)) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping polling backend roundtrip: {e}");
+                return;
+            }
+        };
+        let rx = backend.subscribe_changes();
+        // Let the first ticks establish the baseline snapshot.
+        thread::sleep(Duration::from_millis(300));
+
+        let mut external = match arboard::Clipboard::new() {
+            Ok(cb) => cb,
+            Err(e) => {
+                eprintln!("skipping polling backend roundtrip: no X display: {e}");
+                return;
+            }
+        };
+        external
+            .set_text("clipcast-poll-in")
+            .expect("external x11 copy");
+        let ev = recv_matching(&rx, Duration::from_secs(3), "clipcast-poll-in")
+            .expect("polling backend must observe the change");
+        assert!(!ev.sensitive);
+        drop(external);
     }
 }

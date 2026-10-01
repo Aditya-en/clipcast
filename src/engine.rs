@@ -45,6 +45,18 @@ pub trait ClipboardBackend {
     fn subscribe_changes(&self) -> Receiver<ClipboardEvent>;
 }
 
+impl ClipboardBackend for Box<dyn ClipboardBackend> {
+    fn get_text(&self) -> std::io::Result<Option<String>> {
+        (**self).get_text()
+    }
+    fn set_text(&self, text: &str) -> std::io::Result<()> {
+        (**self).set_text(text)
+    }
+    fn subscribe_changes(&self) -> Receiver<ClipboardEvent> {
+        (**self).subscribe_changes()
+    }
+}
+
 /// Packet transport.
 pub trait Transport {
     fn send(&self, bytes: &[u8]);
