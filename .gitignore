@@ -1,0 +1,16 @@
+# Rust (Cargo.lock stays tracked: reproducible binary builds)
+/target
+
+# Android / Gradle
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.DS_Store
+
+# Signing keys — never commit these
+*.jks
+*.keystore
+*.p12
+.env

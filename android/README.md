@@ -30,13 +30,13 @@ Text over the 1200 byte UDP limit syncs via a TCP side channel:
 - Data frames: `len u32 || ciphertext(flags(1) + up to 65536 data bytes + 16-byte tag)`; bit 0 of flags = FINAL, others must be zero. The server sends 64 KiB frames, the last carrying FINAL (an empty FINAL frame terminates exact multiples). The client requires exactly one FINAL, nothing after it, exact `total_len`, matching SHA-256, and strict UTF-8 — otherwise it applies nothing.
 - Timeouts: 3 s connect, 3 s handshake read, 10 s idle per read, 120 s overall per transfer. At most 2 concurrent fetches (a newer accepted message cancels an older one) and 4 concurrent inbound connections (extras closed immediately).
 
-See [clipcast/docs/test-vectors.md](../clipcast/docs/test-vectors.md) and [clipcast/docs/test-vectors-v2.md](../clipcast/docs/test-vectors-v2.md) for cross-implementation test vectors.
+See [clipcast/docs/test-vectors.md](../desktop/docs/test-vectors.md) and [clipcast/docs/test-vectors-v2.md](../desktop/docs/test-vectors-v2.md) for cross-implementation test vectors.
 
 ## Build
 
 ```bash
-cd clipshare
-./gradlew assembleRelease
+cd android
+gradle :app:assembleRelease
 ```
 
 Output: `app/build/outputs/apk/release/app-release.apk`
@@ -44,7 +44,7 @@ Output: `app/build/outputs/apk/release/app-release.apk`
 Requires:
 - JDK 17+
 - Android SDK (API 34)
-- Gradle 8.5+ (via wrapper)
+- Gradle (system install; no wrapper checked in)
 
 ## Installation
 
