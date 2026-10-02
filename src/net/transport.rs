@@ -17,6 +17,7 @@ use std::time::Duration;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tracing::debug;
 
+use crate::engine::Datagram;
 use crate::net::interfaces::discover;
 
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -33,7 +34,7 @@ struct Inner {
     allow: Vec<String>,
     deny: Vec<String>,
     targets: Mutex<Vec<SendTarget>>,
-    rx: Mutex<Option<Receiver<Vec<u8>>>>,
+    rx: Mutex<Option<Receiver<Datagram>>>,
     refresh: Duration,
 }
 
@@ -63,13 +64,14 @@ impl UdpTransport {
         ))))?;
         let recv_sock: std::net::UdpSocket = recv_sock.into();
 
-        let (tx, rx) = channel::<Vec<u8>>();
+        let (tx, rx) = channel::<Datagram>();
         std::thread::spawn(move || {
             let mut buf = [0u8; RECV_BUF];
             loop {
-                match recv_sock.recv(&mut buf) {
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                match recv_sock.recv_from(&mut buf) {
+                    Ok((n, addr)) => {
+                        let datagram = Datagram::new(buf[..n].to_vec(), Some(addr.ip()));
+                        if tx.send(datagram).is_err() {
                             break;
                         }
                     }
@@ -115,7 +117,7 @@ impl crate::engine::Transport for UdpTransport {
         }
     }
 
-    fn recv(&self) -> Receiver<Vec<u8>> {
+    fn recv(&self) -> Receiver<Datagram> {
         self.inner
             .rx
             .lock()
@@ -179,11 +181,12 @@ mod tests {
         let got_b = rx_b
             .recv_timeout(Duration::from_secs(2))
             .expect("b receives");
-        assert_eq!(got_b, b"ping-from-a");
+        assert_eq!(got_b.bytes, b"ping-from-a");
+        assert!(got_b.source.is_some(), "source address is captured");
         let got_a = rx_a
             .recv_timeout(Duration::from_secs(2))
             .expect("a receives own broadcast");
-        assert_eq!(got_a, b"ping-from-a");
+        assert_eq!(got_a.bytes, b"ping-from-a");
     }
 
     #[test]

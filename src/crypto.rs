@@ -43,6 +43,13 @@ pub fn generate_nonce() -> [u8; NONCE_LEN] {
     nonce
 }
 
+/// 16 random bytes identifying one large-text transfer (v2 announce).
+pub fn generate_transfer_id() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    SysRng.try_fill_bytes(&mut id).expect("getrandom failed");
+    id
+}
+
 /// Short non-cryptographic hash of content, used for echo suppression.
 pub fn content_hash(text: &str) -> u64 {
     let digest = Sha256::digest(text.as_bytes());
