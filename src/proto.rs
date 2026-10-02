@@ -30,6 +30,14 @@ pub const CONTENT_TEXT: u8 = 0x01;
 pub const CONTENT_IMAGE: u8 = 0x02;
 pub const CONTENT_ANNOUNCE: u8 = 0x80;
 
+/// Inner content type carried inside an announce payload (v2, extensible for
+/// images/files later). Only text is sent today.
+pub const INNER_TEXT: u8 = 0x01;
+
+/// Announce payload length: inner(1) + transfer_id(16) + total_len(8) +
+/// sha256(32) + tcp_port(2) = 59 bytes.
+pub const ANNOUNCE_PAYLOAD_LEN: usize = 59;
+
 pub const DEVICE_ID_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
 
@@ -50,6 +58,51 @@ pub struct Body {
     pub timestamp_ms: u64,
     pub content_type: u8,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnouncePayload {
+    pub inner_content_type: u8,
+    pub transfer_id: [u8; 16],
+    pub total_len: u64,
+    pub sha256: [u8; 32],
+    pub tcp_port: u16,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AnnounceError {
+    #[error("announce payload must be {expected} bytes, got {got}")]
+    BadLength { expected: usize, got: usize },
+}
+
+pub fn encode_announce(a: &AnnouncePayload) -> [u8; ANNOUNCE_PAYLOAD_LEN] {
+    let mut buf = [0u8; ANNOUNCE_PAYLOAD_LEN];
+    buf[0] = a.inner_content_type;
+    buf[1..17].copy_from_slice(&a.transfer_id);
+    buf[17..25].copy_from_slice(&a.total_len.to_be_bytes());
+    buf[25..57].copy_from_slice(&a.sha256);
+    buf[57..59].copy_from_slice(&a.tcp_port.to_be_bytes());
+    buf
+}
+
+pub fn decode_announce(bytes: &[u8]) -> Result<AnnouncePayload, AnnounceError> {
+    if bytes.len() != ANNOUNCE_PAYLOAD_LEN {
+        return Err(AnnounceError::BadLength {
+            expected: ANNOUNCE_PAYLOAD_LEN,
+            got: bytes.len(),
+        });
+    }
+    let mut transfer_id = [0u8; 16];
+    transfer_id.copy_from_slice(&bytes[1..17]);
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(&bytes[25..57]);
+    Ok(AnnouncePayload {
+        inner_content_type: bytes[0],
+        transfer_id,
+        total_len: u64::from_be_bytes(bytes[17..25].try_into().unwrap()),
+        sha256,
+        tcp_port: u16::from_be_bytes(bytes[57..59].try_into().unwrap()),
+    })
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -284,6 +337,41 @@ mod tests {
             }
             let _ = decode_header(&bytes);
             let _ = decode_body(&bytes);
+            let _ = decode_announce(&bytes);
+        }
+    }
+
+    #[test]
+    fn announce_round_trip() {
+        let a = AnnouncePayload {
+            inner_content_type: INNER_TEXT,
+            transfer_id: [0xA5; 16],
+            total_len: 5_000_000,
+            sha256: [0x5A; 32],
+            tcp_port: 47475,
+        };
+        let bytes = encode_announce(&a);
+        assert_eq!(bytes.len(), ANNOUNCE_PAYLOAD_LEN);
+        assert_eq!(bytes.len(), 59);
+        assert_eq!(decode_announce(&bytes).unwrap(), a);
+    }
+
+    #[test]
+    fn announce_rejects_bad_length() {
+        assert!(decode_announce(&[0u8; 58]).is_err());
+        assert!(decode_announce(&[0u8; 60]).is_err());
+        assert!(decode_announce(&[]).is_err());
+        // Fuzz: no length other than 59 is accepted, never panics.
+        for len in [0, 1, 21, 58, 60, 100, 200] {
+            let v = vec![0u8; len];
+            assert_eq!(
+                decode_announce(&v),
+                Err(AnnounceError::BadLength {
+                    expected: ANNOUNCE_PAYLOAD_LEN,
+                    got: len
+                }),
+                "len {len}"
+            );
         }
     }
 }
