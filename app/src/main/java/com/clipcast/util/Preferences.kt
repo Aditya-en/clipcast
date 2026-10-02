@@ -14,6 +14,9 @@ class Preferences(private val prefs: SharedPreferences) {
         private const val KEY_AUTOSTART = "autostart"
         private const val KEY_TCP_PORT = "tcp_port"
         private const val KEY_MAX_APPLY_BYTES = "max_apply_bytes"
+        private const val KEY_ASKED_NOTIFICATIONS = "asked_notifications"
+        private const val KEY_HINT_NOTIF_DISMISSED = "hint_notif_dismissed"
+        private const val KEY_HINT_BATTERY_DISMISSED = "hint_battery_dismissed"
         private const val DEFAULT_PORT = 47474
 
         fun getInstance(context: Context): Preferences {
@@ -82,6 +85,26 @@ class Preferences(private val prefs: SharedPreferences) {
     fun isConfigured(): Boolean {
         return encryptionKey != null && Crypto.validateKey(encryptionKey!!)
     }
+
+    /** True once the notification permission dialog has been shown. */
+    var askedNotifications: Boolean
+        get() = prefs.getBoolean(KEY_ASKED_NOTIFICATIONS, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_ASKED_NOTIFICATIONS, value).apply()
+        }
+
+    /** Dismissible one-at-a-time hint flags. */
+    var hintNotifDismissed: Boolean
+        get() = prefs.getBoolean(KEY_HINT_NOTIF_DISMISSED, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_HINT_NOTIF_DISMISSED, value).apply()
+        }
+
+    var hintBatteryDismissed: Boolean
+        get() = prefs.getBoolean(KEY_HINT_BATTERY_DISMISSED, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_HINT_BATTERY_DISMISSED, value).apply()
+        }
 
     fun getKeyBytes(): ByteArray? {
         return encryptionKey?.let { Crypto.decodeKey(it) }

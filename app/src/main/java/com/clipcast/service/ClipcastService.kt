@@ -97,6 +97,7 @@ class ClipcastService : Service() {
             setListener(object : NetworkManager.BroadcastAddressListener {
                 override fun onBroadcastAddressChanged(address: InetAddress?) {
                     currentBroadcastAddress = address
+                    refreshNotification()
                     publishState()
                 }
             })
@@ -594,6 +595,17 @@ class ClipcastService : Service() {
         )
     }
 
+    /** Rebuild the foreground notification (e.g. the local IP changed). */
+    private fun refreshNotification() {
+        if (!isRunning) return
+        try {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(NOTIFICATION_ID, buildNotification())
+        } catch (e: Exception) {
+            Log.d("ClipcastService", "notification refresh failed", e)
+        }
+    }
+
     private fun buildNotification(): Notification {
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -609,19 +621,14 @@ class ClipcastService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val stopIntent = Intent(this, ClipcastService::class.java).apply {
-            action = ACTION_STOP
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 2, stopIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
+        // Low priority, ongoing, quiet: title + local IP, one action.
+        // Tapping the notification opens the main screen.
+        val ip = networkManager?.getLocalIpv4()
         // Framework builder (minSdk 26: channels exist, no compat needed).
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_upload)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText(getString(R.string.notification_text))
+            .setContentText(ip ?: getString(R.string.notification_text_waiting))
             .setContentIntent(openPendingIntent)
             .addAction(
                 android.app.Notification.Action.Builder(
@@ -630,15 +637,6 @@ class ClipcastService : Service() {
                     ),
                     getString(R.string.notification_action_send),
                     sendPendingIntent
-                ).build()
-            )
-            .addAction(
-                android.app.Notification.Action.Builder(
-                    android.graphics.drawable.Icon.createWithResource(
-                        this, android.R.drawable.ic_menu_close_clear_cancel
-                    ),
-                    "Stop",
-                    stopPendingIntent
                 ).build()
             )
             .setOngoing(true)

@@ -39,6 +39,7 @@ class MainActivity : Activity() {
         const val EXTRA_SCROLL_TO_KEY = "extra_scroll_to_key"
         private const val SENT_FLASH_MS = 2000L
         private const val COPIED_MS = 1500L
+        private const val REQUEST_NOTIFICATIONS = 41
     }
 
     private var preferences: Preferences? = null
@@ -64,6 +65,13 @@ class MainActivity : Activity() {
     private lateinit var detailSent: TextView
     private lateinit var sendButton: Button
     private lateinit var sendReason: TextView
+    private lateinit var firstRunCard: View
+    private lateinit var pasteKeyButton: Button
+    private lateinit var firstRunError: TextView
+    private lateinit var hintCard: View
+    private lateinit var hintText: TextView
+    private lateinit var hintAction: Button
+    private lateinit var hintDismiss: Button
 
     private var updatingSwitch = false
     private var transientReason: String? = null
@@ -116,6 +124,13 @@ class MainActivity : Activity() {
         detailSent = findViewById(R.id.detailSent)
         sendButton = findViewById(R.id.sendButton)
         sendReason = findViewById(R.id.sendReason)
+        firstRunCard = findViewById(R.id.firstRunCard)
+        pasteKeyButton = findViewById(R.id.pasteKeyButton)
+        firstRunError = findViewById(R.id.firstRunError)
+        hintCard = findViewById(R.id.hintCard)
+        hintText = findViewById(R.id.hintText)
+        hintAction = findViewById(R.id.hintAction)
+        hintDismiss = findViewById(R.id.hintDismiss)
 
         serviceSwitch.contentDescription = getString(R.string.status_off)
         serviceSwitch.setOnCheckedChangeListener { _, isChecked ->
@@ -139,6 +154,12 @@ class MainActivity : Activity() {
         }
         sendButton.setOnClickListener {
             sendClipboardNow()
+        }
+        pasteKeyButton.setOnClickListener {
+            pasteKeyFromClipboard()
+        }
+        hintDismiss.setOnClickListener {
+            dismissCurrentHint()
         }
 
         if (savedInstanceState != null) {
@@ -194,8 +215,47 @@ class MainActivity : Activity() {
             openSettings(scrollToKey = true)
             return
         }
-        // Notification-permission request lands here in M4; until then start.
+        // Ask for notification permission the first time sync is turned on,
+        // with a one-sentence explanation — never at app launch.
+        if (needsNotifPermission() && preferences?.askedNotifications != true) {
+            android.app.AlertDialog.Builder(this)
+                .setMessage(R.string.notif_rationale)
+                .setPositiveButton(R.string.notif_allow) { _, _ ->
+                    preferences?.askedNotifications = true
+                    requestPermissions(
+                        arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                        REQUEST_NOTIFICATIONS
+                    )
+                }
+                .setNegativeButton(R.string.notif_later) { _, _ ->
+                    startService()
+                }
+                .setOnCancelListener {
+                    setSwitchChecked(false)
+                }
+                .show()
+            return
+        }
         startService()
+    }
+
+    private fun needsNotifPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        return checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_NOTIFICATIONS) {
+            // Start regardless; a denial surfaces as the dismissible hint.
+            if (ServiceStateHolder.last.configured) startService()
+            else setSwitchChecked(false)
+        }
     }
 
     private fun startService() {
@@ -252,6 +312,122 @@ class MainActivity : Activity() {
         renderStatus(screen)
         renderActivity(screen, now)
         renderSend(screen, now)
+        renderFirstRun()
+        renderHint(screen)
+    }
+
+    private fun renderFirstRun() {
+        val show = preferences?.isConfigured() != true
+        firstRunCard.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) firstRunError.visibility = View.GONE
+    }
+
+    /** Validates the clipboard key, saves it, and starts sync. */
+    private fun pasteKeyFromClipboard() {
+        val pasted = try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            if (!cm.hasPrimaryClip()) null
+            else cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+        } catch (e: Exception) {
+            null
+        }
+        val result = SettingsValidation.validateKey(pasted)
+        if (result is SettingsValidation.KeyResult.Valid) {
+            preferences?.encryptionKey = SettingsValidation.canonicalKey(pasted)
+            firstRunError.visibility = View.GONE
+            startService()
+        } else {
+            firstRunError.visibility = View.VISIBLE
+            firstRunError.text = when (result) {
+                is SettingsValidation.KeyResult.Invalid -> result.reason
+                else -> getString(R.string.key_paste_fail)
+            }
+            firstRunError.setTextColor(tintFor(R.attr.clipStatusError))
+        }
+    }
+
+    // --- conditional hints (at most one, dismissible) -------------------------
+
+    private enum class Hint { NOTIFICATIONS, BATTERY }
+
+    private var activeHint: Hint? = null
+
+    private fun renderHint(screen: StatusMapper.MainScreen) {
+        activeHint = when {
+            notifHintDue() -> Hint.NOTIFICATIONS
+            batteryHintDue() -> Hint.BATTERY
+            else -> null
+        }
+        when (val hint = activeHint) {
+            null -> hintCard.visibility = View.GONE
+            Hint.NOTIFICATIONS -> {
+                hintCard.visibility = View.VISIBLE
+                hintText.setText(R.string.hint_notifications)
+                hintAction.setText(R.string.hint_notifications_action)
+                hintAction.setOnClickListener { openNotificationSettings() }
+            }
+            Hint.BATTERY -> {
+                hintCard.visibility = View.VISIBLE
+                hintText.setText(R.string.hint_battery)
+                hintAction.setText(R.string.hint_battery_action)
+                hintAction.setOnClickListener { openBatterySettings() }
+            }
+        }
+    }
+
+    private fun notifHintDue(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        if (preferences?.hintNotifDismissed == true) return false
+        if (preferences?.askedNotifications != true) return false
+        return !hasNotifPermission()
+    }
+
+    private fun hasNotifPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+        return checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun batteryHintDue(): Boolean {
+        if (!ServiceStateHolder.last.running) return false
+        if (preferences?.hintBatteryDismissed == true) return false
+        val pm: android.os.PowerManager = try {
+            getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        } catch (e: Exception) {
+            return false
+        }
+        return !pm.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun dismissCurrentHint() {
+        when (activeHint) {
+            Hint.NOTIFICATIONS -> preferences?.hintNotifDismissed = true
+            Hint.BATTERY -> preferences?.hintBatteryDismissed = true
+            null -> return
+        }
+        lastScreen?.let { renderHint(it) }
+    }
+
+    private fun openNotificationSettings() {
+        try {
+            startActivity(
+                Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                    putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, packageName)
+                }
+            )
+        } catch (e: Exception) {
+            // OEM without this screen; the hint can be dismissed.
+        }
+    }
+
+    private fun openBatterySettings() {
+        try {
+            startActivity(
+                Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            )
+        } catch (e: Exception) {
+            // OEM without this screen; the hint can be dismissed.
+        }
     }
 
     private fun renderStatus(screen: StatusMapper.MainScreen) {
