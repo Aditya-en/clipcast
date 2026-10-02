@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- M1 scaffolding: same fields as before, framework widgets only.
+     The redesigned main screen lands in M2. -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:padding="16dp">
@@ -16,7 +19,7 @@
             android:text="@string/app_name"
             android:textSize="24sp"
             android:textStyle="bold"
-            android:layout_marginBottom="24dp"/>
+            android:layout_marginBottom="24dp" />
 
         <TextView
             android:id="@+id/deviceIdLabel"
@@ -24,7 +27,7 @@
             android:layout_height="wrap_content"
             android:text="@string/device_id_label"
             android:textSize="14sp"
-            android:layout_marginBottom="8dp"/>
+            android:layout_marginBottom="8dp" />
 
         <TextView
             android:id="@+id/deviceIdValue"
@@ -32,74 +35,50 @@
             android:layout_height="wrap_content"
             android:textSize="12sp"
             android:fontFamily="monospace"
-            android:layout_marginBottom="24dp"/>
+            android:layout_marginBottom="24dp" />
 
-        <com.google.android.material.textfield.TextInputLayout
-            android:id="@+id/keyLayout"
+        <EditText
+            android:id="@+id/keyInput"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:hint="@string/pref_key"
-            android:layout_marginBottom="16dp">
+            android:inputType="textNoSuggestions|textVisiblePassword"
+            android:maxLines="1"
+            android:layout_marginBottom="16dp" />
 
-            <com.google.android.material.textfield.TextInputEditText
-                android:id="@+id/keyInput"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:inputType="textNoSuggestions|textVisiblePassword"
-                android:maxLines="1"/>
-        </com.google.android.material.textfield.TextInputLayout>
-
-        <com.google.android.material.textfield.TextInputLayout
-            android:id="@+id/portLayout"
+        <EditText
+            android:id="@+id/portInput"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:hint="@string/pref_port"
-            android:layout_marginBottom="16dp">
+            android:inputType="number"
+            android:maxLines="1"
+            android:layout_marginBottom="16dp" />
 
-            <com.google.android.material.textfield.TextInputEditText
-                android:id="@+id/portInput"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:inputType="number"
-                android:maxLines="1"/>
-        </com.google.android.material.textfield.TextInputLayout>
-
-        <com.google.android.material.textfield.TextInputLayout
-            android:id="@+id/tcpPortLayout"
+        <EditText
+            android:id="@+id/tcpPortInput"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:hint="@string/pref_tcp_port"
-            android:layout_marginBottom="16dp">
+            android:inputType="number"
+            android:maxLines="1"
+            android:layout_marginBottom="16dp" />
 
-            <com.google.android.material.textfield.TextInputEditText
-                android:id="@+id/tcpPortInput"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:inputType="number"
-                android:maxLines="1"/>
-        </com.google.android.material.textfield.TextInputLayout>
-
-        <com.google.android.material.textfield.TextInputLayout
-            android:id="@+id/maxApplyLayout"
+        <EditText
+            android:id="@+id/maxApplyInput"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:hint="@string/pref_max_apply"
-            android:layout_marginBottom="16dp">
-
-            <com.google.android.material.textfield.TextInputEditText
-                android:id="@+id/maxApplyInput"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:inputType="number"
-                android:maxLines="1"/>
-        </com.google.android.material.textfield.TextInputLayout>
+            android:inputType="number"
+            android:maxLines="1"
+            android:layout_marginBottom="16dp" />
 
         <CheckBox
             android:id="@+id/autostartCheck"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="@string/pref_autostart"
-            android:layout_marginBottom="24dp"/>
+            android:layout_marginBottom="24dp" />
 
         <Switch
             android:id="@+id/serviceSwitch"
@@ -107,7 +86,7 @@
             android:layout_height="wrap_content"
             android:textOff="@string/btn_start"
             android:textOn="@string/btn_stop"
-            android:layout_marginBottom="24dp"/>
+            android:layout_marginBottom="24dp" />
 
         <TextView
             android:id="@+id/statusText"
@@ -116,7 +95,7 @@
             android:text="@string/status_stopped"
             android:textSize="14sp"
             android:gravity="center"
-            android:layout_marginBottom="16dp"/>
+            android:layout_marginBottom="16dp" />
 
         <TextView
             android:id="@+id/lastRxText"
@@ -124,7 +103,7 @@
             android:layout_height="wrap_content"
             android:textSize="12sp"
             android:gravity="center"
-            android:layout_marginBottom="8dp"/>
+            android:layout_marginBottom="8dp" />
 
         <TextView
             android:id="@+id/lastTxText"
@@ -132,7 +111,7 @@
             android:layout_height="wrap_content"
             android:textSize="12sp"
             android:gravity="center"
-            android:layout_marginBottom="8dp"/>
+            android:layout_marginBottom="8dp" />
 
         <TextView
             android:id="@+id/tcpStatusText"
@@ -140,7 +119,7 @@
             android:layout_height="wrap_content"
             android:textSize="12sp"
             android:gravity="center"
-            android:layout_marginBottom="8dp"/>
+            android:layout_marginBottom="8dp" />
 
         <TextView
             android:id="@+id/lastTransferText"
@@ -148,12 +127,12 @@
             android:layout_height="wrap_content"
             android:textSize="12sp"
             android:gravity="center"
-            android:layout_marginBottom="24dp"/>
+            android:layout_marginBottom="24dp" />
 
         <Button
             android:id="@+id/sendNowButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="@string/btn_send_now"/>
+            android:text="@string/btn_send_now" />
     </LinearLayout>
 </ScrollView>

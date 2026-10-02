@@ -15,6 +15,8 @@ class NetworkManager(private val context: Context) {
     private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var currentBroadcastAddress: InetAddress? = null
+    private var currentLocalIpv4: String? = null
+    private var wifiConnected = false
     private var listener: BroadcastAddressListener? = null
 
     interface BroadcastAddressListener {
@@ -33,11 +35,13 @@ class NetworkManager(private val context: Context) {
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                updateBroadcastAddress(network)
+                updateBroadcastAddress(network, notifyAlways = true)
             }
 
             override fun onLost(network: Network) {
                 currentBroadcastAddress = null
+                currentLocalIpv4 = null
+                wifiConnected = false
                 listener?.onBroadcastAddressChanged(null)
             }
 
@@ -55,19 +59,38 @@ class NetworkManager(private val context: Context) {
 
     fun stop() {
         networkCallback?.let {
-            connectivityManager.unregisterNetworkCallback(it)
+            try {
+                connectivityManager.unregisterNetworkCallback(it)
+            } catch (e: Exception) {
+                // Already unregistered; ignore.
+            }
             networkCallback = null
         }
         currentBroadcastAddress = null
+        currentLocalIpv4 = null
+        wifiConnected = false
     }
 
     fun getCurrentBroadcastAddress(): InetAddress? = currentBroadcastAddress
 
-    private fun updateBroadcastAddress(network: Network) {
+    /** Device's local IPv4 address (for the status line), or null. */
+    fun getLocalIpv4(): String? = currentLocalIpv4
+
+    /** True while the Wi-Fi network request is satisfied. */
+    fun isWifiConnected(): Boolean = wifiConnected
+
+    private fun updateBroadcastAddress(network: Network, notifyAlways: Boolean = false) {
         // Runs on the ConnectivityThread; never let it throw (would kill the process).
         // On any failure fall back to the limited broadcast address.
+        val linkProperties = try {
+            connectivityManager.getLinkProperties(network)
+        } catch (e: Exception) {
+            android.util.Log.w("ClipcastNet", "LinkProperties unavailable", e)
+            null
+        }
+        val localIp = firstInet4Address(linkProperties)
         val newAddress = try {
-            computeBroadcastAddress(connectivityManager.getLinkProperties(network))
+            computeBroadcastAddress(linkProperties)
         } catch (e: Exception) {
             android.util.Log.w("ClipcastNet", "LinkProperties unavailable, using 255.255.255.255", e)
             try {
@@ -77,10 +100,25 @@ class NetworkManager(private val context: Context) {
             }
         }
 
-        if (newAddress != null && newAddress != currentBroadcastAddress) {
+        val changed = newAddress != currentBroadcastAddress || localIp != currentLocalIpv4
+        wifiConnected = true
+        currentLocalIpv4 = localIp
+        if (newAddress != null) {
             currentBroadcastAddress = newAddress
-            listener?.onBroadcastAddressChanged(newAddress)
         }
+        if (changed || notifyAlways) {
+            listener?.onBroadcastAddressChanged(currentBroadcastAddress)
+        }
+    }
+
+    private fun firstInet4Address(linkProperties: LinkProperties?): String? {
+        linkProperties?.linkAddresses?.forEach { linkAddress ->
+            val address = linkAddress.address
+            if (address is Inet4Address) {
+                return address.hostAddress
+            }
+        }
+        return null
     }
 
     private fun computeBroadcastAddress(linkProperties: LinkProperties?): InetAddress? {

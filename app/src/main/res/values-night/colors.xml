@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark-theme fallback palette. Same roles, raised tones so text and
+         dots keep at least 4.5:1 contrast on the dark card fill. -->
+    <color name="clip_card">#22252C</color>
+    <color name="clip_ok">#7FDA9E</color>
+    <color name="clip_warn">#EFC25E</color>
+    <color name="clip_error">#FFB4AB</color>
+</resources>

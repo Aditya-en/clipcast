@@ -7,14 +7,13 @@ import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
 import com.clipcast.service.ClipcastService
 import com.clipcast.R
 import com.clipcast.protocol.LargeTextLimits
 import com.clipcast.util.ClipboardHelper
 import com.clipcast.util.Preferences
 
-class SendActivity : AppCompatActivity() {
+class SendActivity : Activity() {
     private var hasWindowFocus = false
     private var preferences: Preferences? = null
 

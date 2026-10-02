@@ -13,8 +13,6 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
-import androidx.core.app.NotificationCompat
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.clipcast.ClipcastApplication
 import com.clipcast.R
 import com.clipcast.protocol.Crypto
@@ -22,6 +20,7 @@ import com.clipcast.protocol.LargeTextLimits
 import com.clipcast.protocol.SyncState
 import com.clipcast.ui.MainActivity
 import com.clipcast.ui.SendActivity
+import com.clipcast.ui.ServiceStateHolder
 import com.clipcast.util.ClipboardHelper
 import com.clipcast.util.Preferences
 import java.net.DatagramPacket
@@ -41,16 +40,6 @@ class ClipcastService : Service() {
         const val ACTION_QUERY_STATUS = "com.clipcast.ACTION_QUERY_STATUS"
         const val EXTRA_TEXT = "extra_text"
         const val EXTRA_QUIET = "extra_quiet"
-
-        const val BROADCAST_STATUS = "com.clipcast.BROADCAST_STATUS"
-        const val EXTRA_STATUS = "extra_status"
-        const val EXTRA_BROADCAST_ADDR = "extra_broadcast_addr"
-        const val EXTRA_LAST_RX_TIME = "extra_last_rx_time"
-        const val EXTRA_LAST_RX_LEN = "extra_last_rx_len"
-        const val EXTRA_LAST_TX_TIME = "extra_last_tx_time"
-        const val EXTRA_LAST_TX_LEN = "extra_last_tx_len"
-        const val EXTRA_TCP_STATUS = "extra_tcp_status"
-        const val EXTRA_LAST_TRANSFER = "extra_last_transfer"
 
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "clipcast_sync"
@@ -78,6 +67,13 @@ class ClipcastService : Service() {
     private var messageTimestamps = mutableListOf<Long>()
     private val messageTimestampsLock = Any()
 
+    // UI hooks (no protocol impact): structured error/outcome state for the
+    // status screen, published through ServiceStateHolder.
+    private var lastUdpError: String? = null
+    private var lastTcpError: String? = null
+    private var lastSendOk: Boolean = true
+    private var lastSendError: String? = null
+
     // Large-text side channel (v2).
     private var transferStore: TransferStore? = null
     private var tcpServer: TcpServer? = null
@@ -101,7 +97,7 @@ class ClipcastService : Service() {
             setListener(object : NetworkManager.BroadcastAddressListener {
                 override fun onBroadcastAddressChanged(address: InetAddress?) {
                     currentBroadcastAddress = address
-                    broadcastStatus()
+                    publishState()
                 }
             })
         }
@@ -113,7 +109,7 @@ class ClipcastService : Service() {
         when (action) {
             ACTION_START -> startServiceLogic()
             ACTION_STOP -> stopServiceLogic()
-            ACTION_QUERY_STATUS -> broadcastStatus()
+            ACTION_QUERY_STATUS -> publishState()
             ACTION_SEND_CLIPBOARD -> {
                 val text = intent.getStringExtra(EXTRA_TEXT)
                 val quiet = intent.getBooleanExtra(EXTRA_QUIET, false)
@@ -131,6 +127,7 @@ class ClipcastService : Service() {
         val keyBytes = preferences?.getKeyBytes() ?: return
         val port = preferences?.port ?: 47474
         currentPort = port
+        lastUdpError = null
 
         val wifiManager = getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifiManager.createMulticastLock("clipcast_multicast")
@@ -146,6 +143,7 @@ class ClipcastService : Service() {
             }
         } catch (e: Exception) {
             Log.e("ClipcastService", "Failed to bind socket", e)
+            lastUdpError = "UDP port $port in use"
             stopServiceLogic()
             return
         }
@@ -164,25 +162,29 @@ class ClipcastService : Service() {
             listener = object : TcpServer.Listener {
                 override fun onListening(port: Int) {
                     tcpStatus = "TCP listening on port $port"
-                    broadcastStatus()
+                    lastTcpError = null
+                    publishState()
                 }
 
                 override fun onError(message: String) {
                     tcpStatus = message
-                    broadcastStatus()
+                    lastTcpError = message
+                    publishState()
                 }
             },
             log = { msg -> Log.d("ClipcastTcp", msg) }
         )
         tcpServer = server
+        lastTcpError = null
         tcpStatus = if (server.start()) {
             "TCP listening on port ${server.localPort}"
         } else {
+            lastTcpError = "TCP port $tcpPort in use"
             "TCP port $tcpPort in use"
         }
 
         startForeground(NOTIFICATION_ID, buildNotification())
-        broadcastStatus()
+        publishState()
     }
 
     private fun stopServiceLogic() {
@@ -230,7 +232,7 @@ class ClipcastService : Service() {
 
         stopForeground(true)
         stopSelf()
-        broadcastStatus()
+        publishState()
     }
 
     private fun receiveLoop() {
@@ -318,7 +320,7 @@ class ClipcastService : Service() {
 
         lastRxTime = System.currentTimeMillis()
         lastRxLen = decoded.payload.size
-        broadcastStatus()
+        publishState()
     }
 
     /**
@@ -356,7 +358,7 @@ class ClipcastService : Service() {
                 // Brief, non-intrusive notice via the status line (no toast storm).
                 lastTransfer =
                     "Text too large for the Android clipboard (${announce.totalLen} bytes, max $maxApply)"
-                broadcastStatus()
+                publishState()
                 return
             }
             AnnouncePolicy.Decision.SKIP_UNKNOWN_TYPE -> {
@@ -457,7 +459,7 @@ class ClipcastService : Service() {
     private fun finishFetch(generation: Int, transferStatus: String) {
         synchronized(fetchLock) { activeFetches.remove(generation) }
         lastTransfer = transferStatus
-        broadcastStatus()
+        publishState()
     }
 
     private fun cancelActiveFetchesLocked() {
@@ -548,7 +550,7 @@ class ClipcastService : Service() {
 
                 lastTxTime = System.currentTimeMillis()
                 lastTxLen = payload.size
-                broadcastStatus()
+                publishState()
                 broadcastSendResult(true, payload.size, quiet)
             } catch (e: Exception) {
                 Log.w("ClipcastService", "Send error", e)
@@ -558,25 +560,38 @@ class ClipcastService : Service() {
     }
 
     private fun broadcastSendResult(success: Boolean, length: Int, quiet: Boolean = false, tooLarge: Boolean = false) {
-        val intent = Intent("com.clipcast.SEND_RESULT")
-        intent.putExtra("success", success)
-        intent.putExtra("length", length)
-        intent.putExtra(EXTRA_QUIET, quiet)
-        intent.putExtra("too_large", tooLarge)
-        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+        if (success) {
+            lastSendOk = true
+            lastSendError = null
+        } else {
+            lastSendOk = false
+            lastSendError = if (tooLarge) "too_large" else "failed"
+        }
+        publishState()
+        ServiceStateHolder.emitSend(
+            ServiceStateHolder.SendEvent(success, length, quiet, tooLarge)
+        )
     }
 
-    private fun broadcastStatus() {
-        val intent = Intent(BROADCAST_STATUS)
-        intent.putExtra(EXTRA_STATUS, if (isRunning) "running" else "stopped")
-        intent.putExtra(EXTRA_BROADCAST_ADDR, currentBroadcastAddress?.hostAddress ?: "none")
-        intent.putExtra(EXTRA_LAST_RX_TIME, lastRxTime)
-        intent.putExtra(EXTRA_LAST_RX_LEN, lastRxLen)
-        intent.putExtra(EXTRA_LAST_TX_TIME, lastTxTime)
-        intent.putExtra(EXTRA_LAST_TX_LEN, lastTxLen)
-        intent.putExtra(EXTRA_TCP_STATUS, tcpStatus)
-        intent.putExtra(EXTRA_LAST_TRANSFER, lastTransfer)
-        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+    /** Snapshot everything the UI renders; delivery is always on the main thread. */
+    private fun publishState() {
+        ServiceStateHolder.publish(
+            ServiceStateHolder.Snapshot(
+                running = isRunning,
+                configured = preferences?.isConfigured() == true,
+                wifiConnected = networkManager?.isWifiConnected() == true,
+                localIp = networkManager?.getLocalIpv4(),
+                udpError = lastUdpError,
+                tcpError = lastTcpError,
+                lastRxTime = lastRxTime,
+                lastRxLen = lastRxLen,
+                lastTxTime = lastTxTime,
+                lastTxLen = lastTxLen,
+                lastTransfer = lastTransfer,
+                lastSendOk = lastSendOk,
+                lastSendError = lastSendError
+            )
+        )
     }
 
     private fun buildNotification(): Notification {
@@ -602,16 +617,32 @@ class ClipcastService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        // Framework builder (minSdk 26: channels exist, no compat needed).
+        return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_upload)
             .setContentTitle(getString(R.string.notification_title))
             .setContentText(getString(R.string.notification_text))
             .setContentIntent(openPendingIntent)
-            .addAction(android.R.drawable.ic_menu_send, getString(R.string.notification_action_send), sendPendingIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
+            .addAction(
+                android.app.Notification.Action.Builder(
+                    android.graphics.drawable.Icon.createWithResource(
+                        this, android.R.drawable.ic_menu_send
+                    ),
+                    getString(R.string.notification_action_send),
+                    sendPendingIntent
+                ).build()
+            )
+            .addAction(
+                android.app.Notification.Action.Builder(
+                    android.graphics.drawable.Icon.createWithResource(
+                        this, android.R.drawable.ic_menu_close_clear_cancel
+                    ),
+                    "Stop",
+                    stopPendingIntent
+                ).build()
+            )
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setCategory(Notification.CATEGORY_SERVICE)
             .build()
     }
 

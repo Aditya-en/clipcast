@@ -1,5 +1,6 @@
 package com.clipcast.ui
 
+import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.ClipDescription
 import android.content.ClipboardManager
@@ -15,33 +16,30 @@ import android.util.Base64
 import android.view.View
 import android.widget.Button
 import android.widget.CompoundButton
+import android.widget.EditText
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.clipcast.service.ClipcastService
 import com.clipcast.R
 import com.clipcast.protocol.Crypto
 import com.clipcast.protocol.LargeTextLimits
 import com.clipcast.util.ClipboardHelper
 import com.clipcast.util.Preferences
-import com.google.android.material.textfield.TextInputEditText
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : Activity() {
     private var preferences: Preferences? = null
-    private var statusReceiver: BroadcastReceiver? = null
-    private var sendResultReceiver: BroadcastReceiver? = null
+    private var stateListener: ServiceStateHolder.StateListener? = null
+    private var sendListener: ServiceStateHolder.SendListener? = null
 
     private lateinit var deviceIdValue: TextView
-    private lateinit var keyInput: TextInputEditText
-    private lateinit var portInput: TextInputEditText
-    private lateinit var tcpPortInput: TextInputEditText
-    private lateinit var maxApplyInput: TextInputEditText
+    private lateinit var keyInput: EditText
+    private lateinit var portInput: EditText
+    private lateinit var tcpPortInput: EditText
+    private lateinit var maxApplyInput: EditText
     private lateinit var autostartCheck: CompoundButton
     private lateinit var serviceSwitch: Switch
     private lateinit var statusText: TextView
@@ -73,6 +71,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        EdgeToEdge.apply(this, findViewById(android.R.id.content))
         setContentView(R.layout.activity_main)
 
         preferences = Preferences.getInstance(this)
@@ -116,36 +115,22 @@ class MainActivity : AppCompatActivity() {
             updateBootReceiver(isChecked)
         }
 
-        statusReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                updateStatusUI(intent)
+        stateListener = ServiceStateHolder.StateListener { snapshot ->
+            updateStatusUI(snapshot)
+        }
+        sendListener = ServiceStateHolder.SendListener { event ->
+            // Quiet (auto-send) results only update the status line, no toast.
+            if (event.quiet) return@SendListener
+            if (event.success) {
+                Toast.makeText(this@MainActivity, getString(R.string.toast_sent, event.length), Toast.LENGTH_SHORT).show()
+            } else if (event.tooLarge) {
+                Toast.makeText(this@MainActivity, getString(R.string.toast_too_large, event.length), Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this@MainActivity, R.string.toast_sent_fail, Toast.LENGTH_SHORT).show()
             }
         }
-
-        sendResultReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                // Quiet (auto-send) results only update the status line, no toast.
-                if (intent?.getBooleanExtra(ClipcastService.EXTRA_QUIET, false) == true) return
-                val success = intent?.getBooleanExtra("success", false) ?: false
-                val length = intent?.getIntExtra("length", 0) ?: 0
-                if (success) {
-                    Toast.makeText(this@MainActivity, getString(R.string.toast_sent, length), Toast.LENGTH_SHORT).show()
-                } else if (intent?.getBooleanExtra("too_large", false) == true) {
-                    Toast.makeText(this@MainActivity, getString(R.string.toast_too_large, length), Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(this@MainActivity, R.string.toast_sent_fail, Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-
-        LocalBroadcastManager.getInstance(this).registerReceiver(
-            statusReceiver!!,
-            IntentFilter(ClipcastService.BROADCAST_STATUS)
-        )
-        LocalBroadcastManager.getInstance(this).registerReceiver(
-            sendResultReceiver!!,
-            IntentFilter("com.clipcast.SEND_RESULT")
-        )
+        ServiceStateHolder.addStateListener(stateListener!!)
+        ServiceStateHolder.addSendListener(sendListener!!)
     }
 
     override fun onResume() {
@@ -170,8 +155,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        statusReceiver?.let { LocalBroadcastManager.getInstance(this).unregisterReceiver(it) }
-        sendResultReceiver?.let { LocalBroadcastManager.getInstance(this).unregisterReceiver(it) }
+        stateListener?.let { ServiceStateHolder.removeStateListener(it) }
+        sendListener?.let { ServiceStateHolder.removeSendListener(it) }
         super.onDestroy()
     }
 
@@ -221,11 +206,8 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, ClipcastService::class.java).apply {
             action = ClipcastService.ACTION_START
         }
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            ContextCompat.startForegroundService(this, intent)
-        } else {
-            startService(intent)
-        }
+        // minSdk 26: startForegroundService always available.
+        startForegroundService(intent)
         serviceSwitch.isChecked = true
         statusText.text = getString(R.string.status_starting)
     }
@@ -333,50 +315,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateStatusUI(intent: Intent?) {
-        val status = intent?.getStringExtra(ClipcastService.EXTRA_STATUS) ?: "stopped"
-        val broadcastAddr = intent?.getStringExtra(ClipcastService.EXTRA_BROADCAST_ADDR) ?: "none"
-        val lastRxTime = intent?.getLongExtra(ClipcastService.EXTRA_LAST_RX_TIME, 0) ?: 0L
-        val lastRxLen = intent?.getIntExtra(ClipcastService.EXTRA_LAST_RX_LEN, 0) ?: 0
-        val lastTxTime = intent?.getLongExtra(ClipcastService.EXTRA_LAST_TX_TIME, 0) ?: 0L
-        val lastTxLen = intent?.getIntExtra(ClipcastService.EXTRA_LAST_TX_LEN, 0) ?: 0
-        val tcpStatus = intent?.getStringExtra(ClipcastService.EXTRA_TCP_STATUS) ?: "TCP stopped"
-        val lastTransfer = intent?.getStringExtra(ClipcastService.EXTRA_LAST_TRANSFER) ?: "none"
-
-        when (status) {
-            "running" -> {
-                serviceSwitch.isChecked = true
-                statusText.text = getString(R.string.status_running, broadcastAddr, preferences?.port ?: 47474)
-            }
-            "starting" -> {
-                serviceSwitch.isChecked = true
-                statusText.text = getString(R.string.status_starting)
-            }
-            else -> {
-                serviceSwitch.isChecked = false
-                if (broadcastAddr == "none") {
-                    statusText.text = getString(R.string.status_no_wifi)
-                } else {
-                    statusText.text = getString(R.string.status_stopped)
-                }
+    private fun updateStatusUI(s: ServiceStateHolder.Snapshot) {
+        if (s.running) {
+            serviceSwitch.isChecked = true
+            statusText.text = getString(R.string.status_running, s.localIp ?: "…", preferences?.port ?: 47474)
+        } else {
+            serviceSwitch.isChecked = false
+            statusText.text = if (!s.wifiConnected) {
+                getString(R.string.status_no_wifi)
+            } else {
+                getString(R.string.status_stopped)
             }
         }
 
-        lastRxText.text = if (lastRxTime > 0) {
-            getString(R.string.last_rx, dateFormat.format(Date(lastRxTime)), lastRxLen)
+        lastRxText.text = if (s.lastRxTime > 0) {
+            getString(R.string.last_rx, dateFormat.format(Date(s.lastRxTime)), s.lastRxLen)
         } else {
             getString(R.string.last_rx, getString(R.string.never), 0)
         }
 
-        lastTxText.text = if (lastTxTime > 0) {
-            getString(R.string.last_tx, dateFormat.format(Date(lastTxTime)), lastTxLen)
+        lastTxText.text = if (s.lastTxTime > 0) {
+            getString(R.string.last_tx, dateFormat.format(Date(s.lastTxTime)), s.lastTxLen)
         } else {
             getString(R.string.last_tx, getString(R.string.never), 0)
         }
 
         // TCP listener state and last transfer result (size + outcome only).
-        tcpStatusText.text = getString(R.string.tcp_listening, tcpStatus)
-        lastTransferText.text = getString(R.string.last_transfer, lastTransfer)
+        tcpStatusText.text = getString(
+            R.string.tcp_listening,
+            if (!s.running) "TCP stopped" else s.tcpError ?: "TCP listening"
+        )
+        lastTransferText.text = getString(R.string.last_transfer, s.lastTransfer)
     }
 
     private fun updateBootReceiver(enabled: Boolean) {
