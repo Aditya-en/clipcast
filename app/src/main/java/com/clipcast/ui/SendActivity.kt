@@ -10,6 +10,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.clipcast.service.ClipcastService
 import com.clipcast.R
+import com.clipcast.protocol.LargeTextLimits
 import com.clipcast.util.ClipboardHelper
 import com.clipcast.util.Preferences
 
@@ -51,14 +52,13 @@ class SendActivity : AppCompatActivity() {
             text = ClipboardHelper.getText(this)
         }
 
-        if (!ClipboardHelper.isValidForSend(text)) {
-            val len = text?.length ?: 0
-            val msg = if (len > ClipboardHelper.getMaxTextLength()) {
-                getString(R.string.toast_oversize, len)
-            } else {
-                "No text to send"
-            }
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        if (text.isNullOrEmpty()) {
+            Toast.makeText(this, "No text to send", Toast.LENGTH_SHORT).show()
+            finish()
+            return
+        }
+        if (text.toByteArray(Charsets.UTF_8).size > LargeTextLimits.DEFAULT_MAX_SEND_BYTES) {
+            Toast.makeText(this, getString(R.string.toast_too_large, text.length), Toast.LENGTH_SHORT).show()
             finish()
             return
         }

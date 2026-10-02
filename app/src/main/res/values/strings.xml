@@ -19,7 +19,9 @@
     <string name="btn_stop">Stop</string>
     <string name="toast_sent">Sent %1$d bytes</string>
     <string name="toast_sent_fail">Send failed</string>
+    <string name="toast_empty">Clipboard is empty — copy some text first</string>
     <string name="toast_oversize">Text too large (%1$d bytes, max 1200)</string>
+    <string name="toast_too_large">Text too large (%1$d chars, max 16 MiB)</string>
     <string name="toast_key_invalid">Invalid key: must be 32 bytes base64</string>
     <string name="toast_service_started">Service started</string>
     <string name="toast_service_stopped">Service stopped</string>

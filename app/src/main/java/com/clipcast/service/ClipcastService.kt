@@ -485,8 +485,14 @@ class ClipcastService : Service() {
             broadcastSendResult(false, text.length, quiet)
             return
         }
-        if (!ClipboardHelper.isValidForSend(text)) {
+        if (text.isEmpty()) {
             broadcastSendResult(false, text.length, quiet)
+            return
+        }
+        val byteLen = text.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size
+        if (byteLen > LargeTextLimits.DEFAULT_MAX_SEND_BYTES) {
+            Log.d("ClipcastService", "text too large to send ($byteLen bytes)")
+            broadcastSendResult(false, text.length, quiet, tooLarge = true)
             return
         }
 
@@ -508,7 +514,33 @@ class ClipcastService : Service() {
             val lamport = syncState?.onLocalSend(nowMs, deviceId) ?: nowMs
 
             val payload = text.toByteArray(charset = java.nio.charset.StandardCharsets.UTF_8)
-            val datagram = Crypto.encode(keyBytes, deviceId, lamport, nowMs, payload) ?: return@execute
+            val datagram = if (payload.size <= LargeTextLimits.UDP_MAX_BYTES) {
+                // Small text: behave as today (v1 CLIP_UPDATE).
+                Crypto.encode(keyBytes, deviceId, lamport, nowMs, payload) ?: return@execute
+            } else {
+                // Large text: register a pending transfer and send one announce.
+                // Several peers may fetch the same transfer during its TTL.
+                val store = transferStore
+                if (store == null) {
+                    Log.w("ClipcastService", "no transfer store; dropping large send")
+                    broadcastSendResult(false, payload.size, quiet)
+                    return@execute
+                }
+                val transferId = TransferStore.newTransferId()
+                val sha = store.insert(transferId, payload)
+                val tcpPort = preferences?.tcpPort ?: LargeTextLimits.DEFAULT_TCP_PORT
+                val announcePayload = try {
+                    Crypto.encodeAnnouncePayload(
+                        Crypto.INNER_TEXT, transferId, payload.size.toLong(), sha, tcpPort
+                    )
+                } catch (e: Exception) {
+                    Log.w("ClipcastService", "announce build failed", e)
+                    broadcastSendResult(false, payload.size, quiet)
+                    return@execute
+                }
+                Crypto.encodeAnnounce(keyBytes, deviceId, lamport, nowMs, announcePayload)
+                    ?: return@execute
+            }
 
             try {
                 val packet = DatagramPacket(datagram, datagram.size, broadcastAddr, port)
@@ -525,11 +557,12 @@ class ClipcastService : Service() {
         }
     }
 
-    private fun broadcastSendResult(success: Boolean, length: Int, quiet: Boolean = false) {
+    private fun broadcastSendResult(success: Boolean, length: Int, quiet: Boolean = false, tooLarge: Boolean = false) {
         val intent = Intent("com.clipcast.SEND_RESULT")
         intent.putExtra("success", success)
         intent.putExtra("length", length)
         intent.putExtra(EXTRA_QUIET, quiet)
+        intent.putExtra("too_large", tooLarge)
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
 
