@@ -40,11 +40,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var deviceIdValue: TextView
     private lateinit var keyInput: TextInputEditText
     private lateinit var portInput: TextInputEditText
+    private lateinit var tcpPortInput: TextInputEditText
+    private lateinit var maxApplyInput: TextInputEditText
     private lateinit var autostartCheck: CompoundButton
     private lateinit var serviceSwitch: Switch
     private lateinit var statusText: TextView
     private lateinit var lastRxText: TextView
     private lateinit var lastTxText: TextView
+    private lateinit var tcpStatusText: TextView
+    private lateinit var lastTransferText: TextView
     private lateinit var sendNowButton: Button
 
     private val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -76,17 +80,23 @@ class MainActivity : AppCompatActivity() {
         deviceIdValue = findViewById(R.id.deviceIdValue)
         keyInput = findViewById(R.id.keyInput)
         portInput = findViewById(R.id.portInput)
+        tcpPortInput = findViewById(R.id.tcpPortInput)
+        maxApplyInput = findViewById(R.id.maxApplyInput)
         autostartCheck = findViewById(R.id.autostartCheck)
         serviceSwitch = findViewById(R.id.serviceSwitch)
         statusText = findViewById(R.id.statusText)
         lastRxText = findViewById(R.id.lastRxText)
         lastTxText = findViewById(R.id.lastTxText)
+        tcpStatusText = findViewById(R.id.tcpStatusText)
+        lastTransferText = findViewById(R.id.lastTransferText)
         sendNowButton = findViewById(R.id.sendNowButton)
 
         deviceIdValue.text = "Device ID: ${Crypto.bytesToHex(preferences?.deviceId ?: ByteArray(16))}"
 
         keyInput.setText(preferences?.encryptionKey ?: "")
         portInput.setText(preferences?.port.toString())
+        tcpPortInput.setText((preferences?.tcpPort ?: LargeTextLimits.DEFAULT_TCP_PORT).toString())
+        maxApplyInput.setText(((preferences?.maxApplyBytes ?: LargeTextLimits.DEFAULT_MAX_APPLY_BYTES) / 1024).toString())
         autostartCheck.isChecked = preferences?.autostart ?: false
 
         serviceSwitch.setOnCheckedChangeListener { _, isChecked ->
@@ -168,6 +178,8 @@ class MainActivity : AppCompatActivity() {
     private fun validateAndStart() {
         val key = keyInput.text.toString().trim()
         val portStr = portInput.text.toString().trim()
+        val tcpPortStr = tcpPortInput.text.toString().trim()
+        val maxApplyStr = maxApplyInput.text.toString().trim()
 
         if (TextUtils.isEmpty(key) || !Crypto.validateKey(key)) {
             Toast.makeText(this, R.string.toast_key_invalid, Toast.LENGTH_LONG).show()
@@ -182,8 +194,25 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        val tcpPort = tcpPortStr.toIntOrNull() ?: LargeTextLimits.DEFAULT_TCP_PORT
+        if (tcpPort < 1 || tcpPort > 65535) {
+            Toast.makeText(this, "Invalid TCP port", Toast.LENGTH_SHORT).show()
+            serviceSwitch.isChecked = false
+            return
+        }
+
+        val maxApplyKiB = maxApplyStr.toIntOrNull()
+            ?: (LargeTextLimits.DEFAULT_MAX_APPLY_BYTES / 1024)
+        if (maxApplyKiB < 0 || maxApplyKiB > LargeTextLimits.MAX_APPLY_HARD_CAP / 1024) {
+            Toast.makeText(this, "Max applied text must be 0–900 KiB", Toast.LENGTH_SHORT).show()
+            serviceSwitch.isChecked = false
+            return
+        }
+
         preferences?.encryptionKey = key
         preferences?.port = port
+        preferences?.tcpPort = tcpPort
+        preferences?.maxApplyBytes = maxApplyKiB * 1024
 
         startService()
     }
@@ -311,6 +340,8 @@ class MainActivity : AppCompatActivity() {
         val lastRxLen = intent?.getIntExtra(ClipcastService.EXTRA_LAST_RX_LEN, 0) ?: 0
         val lastTxTime = intent?.getLongExtra(ClipcastService.EXTRA_LAST_TX_TIME, 0) ?: 0L
         val lastTxLen = intent?.getIntExtra(ClipcastService.EXTRA_LAST_TX_LEN, 0) ?: 0
+        val tcpStatus = intent?.getStringExtra(ClipcastService.EXTRA_TCP_STATUS) ?: "TCP stopped"
+        val lastTransfer = intent?.getStringExtra(ClipcastService.EXTRA_LAST_TRANSFER) ?: "none"
 
         when (status) {
             "running" -> {
@@ -342,6 +373,10 @@ class MainActivity : AppCompatActivity() {
         } else {
             getString(R.string.last_tx, getString(R.string.never), 0)
         }
+
+        // TCP listener state and last transfer result (size + outcome only).
+        tcpStatusText.text = getString(R.string.tcp_listening, tcpStatus)
+        lastTransferText.text = getString(R.string.last_transfer, lastTransfer)
     }
 
     private fun updateBootReceiver(enabled: Boolean) {

@@ -253,7 +253,11 @@ object TcpCrypto {
      * counter is passed through for API symmetry with the Rust caller.)
      */
     class FrameAssembler(val totalLen: Long) {
-        private val buf = java.io.ByteArrayOutputStream()
+        // Pre-sized from total_len (clamped for safety); the buffer never
+        // grows past total_len (feed rejects any overflow).
+        private val buf = java.io.ByteArrayOutputStream(
+            totalLen.coerceIn(0, 16L * 1024 * 1024).toInt()
+        )
         private var gotFinal = false
 
         /**

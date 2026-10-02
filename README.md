@@ -4,22 +4,33 @@ A lightweight LAN clipboard sync client for Android. Interoperates with the desk
 
 ## Features
 
-- **Text-only sync** (v1): Plain text clipboard synchronization over LAN
+- **Text sync** (v1 + v2 side channel): short text over UDP, large text (up to 16 MiB sends) over an encrypted TCP side channel
 - **Minimal dependencies**: Android SDK + Kotlin stdlib only (no third-party libraries)
 - **Tiny APK**: ~200KB release build with R8 shrinking
 - **Low battery**: Foreground service with MulticastLock, no wake lock
-- **Strict protocol compatibility**: Byte-exact implementation of wire protocol v1
+- **Strict protocol compatibility**: Byte-exact implementation of wire protocols v1 and v2 (verified against the desktop test vectors)
 
 ## Protocol
 
-Implements the clipcast wire protocol v1:
+Implements the clipcast wire protocol v1 plus the v2 large-text TCP side channel:
+
 - UDP port 47474 (configurable)
 - AES-256-GCM encryption with 32-byte shared key (base64)
 - 16-byte device ID (generated per-install)
 - Lamport clock for ordering with device ID tiebreak
-- Max 1200 byte payload, 1400 byte datagram
+- Max 1200 byte payload, 1400 byte datagram (v1 small text)
 
-See [clipcast/docs/test-vectors.md](../clipcast/docs/test-vectors.md) for cross-implementation test vectors.
+### Large text (v2 side channel)
+
+Text over the 1200 byte UDP limit syncs via a TCP side channel:
+
+- The sender registers a pending transfer (16-byte random `transfer_id`, kept 120 s, newest 4, 32 MiB total cap, served at most 16 times) and broadcasts **one UDP announce**: a normal v1 datagram with `content_type = 0x80` whose 59-byte payload is `inner_content_type(1) || transfer_id(16) || total_len u64(8) || sha256(32) || tcp_port u16(2)`. The announce carries the message's Lamport clock as usual, so ordering and echo rules are unchanged.
+- The receiver fetches from the announce's UDP source address at the announce's `tcp_port`: it sends a 70-byte `CCLT` request header (`magic || version=1 || FETCH=0x01 || client_device_id(16) || transfer_id(16) || client_nonce(32)`) plus a 16-byte handshake tag (AES-256-GCM of empty plaintext), then reads sealed data frames.
+- Session key: HKDF-SHA256 (RFC 5869) with IKM = shared key, salt = `client_nonce`, info = ASCII `clipcast tcp v1` + `transfer_id` (implemented with `HmacSHA256`; extract + one expand block for the 32-byte output). AEAD nonce: direction byte + 3 zero bytes + u64 frame counter; AAD = the 70-byte request header for every frame.
+- Data frames: `len u32 || ciphertext(flags(1) + up to 65536 data bytes + 16-byte tag)`; bit 0 of flags = FINAL, others must be zero. The server sends 64 KiB frames, the last carrying FINAL (an empty FINAL frame terminates exact multiples). The client requires exactly one FINAL, nothing after it, exact `total_len`, matching SHA-256, and strict UTF-8 — otherwise it applies nothing.
+- Timeouts: 3 s connect, 3 s handshake read, 10 s idle per read, 120 s overall per transfer. At most 2 concurrent fetches (a newer accepted message cancels an older one) and 4 concurrent inbound connections (extras closed immediately).
+
+See [clipcast/docs/test-vectors.md](../clipcast/docs/test-vectors.md) and [clipcast/docs/test-vectors-v2.md](../clipcast/docs/test-vectors-v2.md) for cross-implementation test vectors.
 
 ## Build
 
@@ -45,18 +56,37 @@ Requires:
 
 ## Usage
 
-### Sending clipboard text (4 paths)
+### Sending clipboard text (5 paths)
 
 | Path | How |
 |------|-----|
-| **Auto (foreground)** | App open → copy text → sent automatically |
-| **Share menu** | Select text → Share → "Clipcast Send" |
+| **Auto (foreground)** | App open → copy text → sent automatically (small and large) |
+| **Share menu** | Select text → Share → "Clipcast Send" (small and large) |
 | **Quick Settings tile** | Swipe down → "Clipcast Send" tile → reads clipboard → sends |
 | **Notification action** | Pull notification shade → "Send clipboard" button |
+| **Send now button** | In-app button → sends current clipboard |
+
+Small text (≤ 1200 bytes) goes over UDP as before. Larger text (up to 16 MiB) is served from the phone over TCP: the app announces it once over UDP and serves fetches while the foreground service is alive. Past 16 MiB the app tells you the text is too large.
 
 ### Receiving
 
-Works in background via foreground service. Remote text appears in clipboard automatically.
+Works in background via foreground service. Remote text appears in clipboard automatically. Small text applies directly; large-text announces are fetched over TCP (max 2 at a time; a newer accepted message cancels an older fetch) and applied only after length, SHA-256, and UTF-8 verification. The status line shows the last transfer result (size and success/failure, never content).
+
+## Android Clipboard (Binder) Limit
+
+**Important**: `setPrimaryClip()` goes through Binder, which fails near 1 MB. The app therefore refuses to apply fetched text over **max applied text size** (default **512 KiB**, hard-capped at **900 KB** in the UI). An over-limit announce is skipped with a debug log and a brief status-line notice ("Text too large for the Android clipboard") — no toast storm, nothing applied.
+
+## Settings
+
+| Setting | Default | Notes |
+|---------|---------|-------|
+| UDP port | 47474 | Must match the daemon's UDP port |
+| TCP port | 47475 | Our listener; peers learn it from our announces |
+| Max applied text | 512 KiB | Cap on fetched text applied to the clipboard; hard-capped at 900 KB |
+
+**Firewall implications (desktop side):** the desktop daemon must be reachable from the phone — allow inbound UDP on its UDP port *and* inbound TCP on its `tcp_port` in the desktop firewall. In the other direction, LAN peers must be able to open TCP to the phone's TCP port: guest Wi-Fi networks with client isolation, or Android hotspot/Tethering setups that block inbound connections, will break phone→desktop large sends (small UDP text may still work). If large sends fail while small text syncs, check isolation/firewall first.
+
+## Android Clipboard Limitations
 
 ## Android Clipboard Limitations
 
@@ -72,18 +102,23 @@ Works in background via foreground service. Remote text appears in clipboard aut
 
 ```
 MainActivity (UI) ←→ LocalBroadcastManager ←→ ClipcastService (Foreground)
-                                                    ↓
-                        NetworkManager ←→ DatagramSocket (UDP recv loop)
-                                                    ↓
-                        SyncState (Lamport) + Crypto (AES-GCM)
+                                                     ↓
+                         NetworkManager ←→ DatagramSocket (UDP recv loop)
+                                                     ↓
+                         SyncState (Lamport) + Crypto (AES-GCM)
+                                                     ↓
+                    Large text: AnnouncePolicy → TcpFetchClient (2-thread pool)
+                                TransferStore ← TcpServer (ServerSocket + pool of 4)
 ```
 
-- **MainActivity**: Settings, status, manual send button
+- **MainActivity**: Settings (key, UDP/TCP ports, max applied text), status incl. TCP state + last transfer, manual send button
 - **SendActivity**: Transparent activity for Share/QS tile/notification action
-- **ClipcastService**: UDP receive, decrypt, apply to clipboard, send queue
+- **ClipcastService**: UDP receive, decrypt, apply to clipboard, send queue; announce handling + fetch pool + TCP listener lifecycle
 - **NetworkManager**: Computes directed broadcast address from LinkProperties, tracks network changes
 - **SyncState**: Lamport clock + device ID tiebreak (identical to desktop)
-- **Crypto**: AES-256-GCM with header as AAD
+- **Crypto**: AES-256-GCM with header as AAD; 0x80 announce encode/decode (v1 path unchanged)
+- **TcpCrypto**: HKDF-SHA256, CCLT header, handshake tag, frame seal/open, reassembly + content verification (pure JVM, unit-tested against the desktop vectors)
+- **TransferStore / TcpServer / TcpFetchClient / AnnouncePolicy**: pending sends, inbound listener, outbound fetch, receive gate
 
 ## Permissions
 
@@ -108,6 +143,7 @@ Uses `specialUse` with property `android:foregroundServiceType="specialUse"` in 
 - **No wake lock** — relies on Wi-Fi staying associated
 - Doze mode / screen-off Wi-Fi power saving **may delay delivery** (device-dependent)
 - Rate limits: 20 msg/s incoming, 100 ms debounce outgoing
+- **Doze and the TCP listener**: the phone serves large-text fetches only while the foreground service is alive. Doze (screen off, stationary, unplugged) can suspend the service's network access and delay or break inbound TCP connections and outbound fetches; maintenance windows may let small UDP text through while a large transfer stalls. If large syncs fail with the screen off, wake the phone and retry. Exempting the app from battery optimization reduces (but does not eliminate) this on stock Android; OEM skins vary.
 
 ## Storage
 
@@ -129,23 +165,34 @@ Tests cover:
 - Ordering rules (Lamport + device ID tiebreak)
 - Oversize payload handling
 - Edge cases (empty, unicode, large lamport)
+- v2 vectors (byte-exact): HKDF session key, request header, handshake tag, data + empty-FINAL frames
+- v2 framing: tampered header/frame/flags/counter rejected; truncated stream, missing FINAL, data after FINAL, wrong length/hash/UTF-8 rejected
+- Announce encode/decode round trip + malformed input; v1/announce cross-decode rejection
+- Pending-transfer eviction (newest 4), TTL, memory cap, 16-fetch budget
+- Fetch client: loopback (small, multiframe, ~5 MB), wrong key/hash, over-limit + pre-cancelled without connecting, mid-flight cancel, stub-server negative cases
+- Announce policy: over-limit skip (incl. huge u64), unknown inner type, duplicate hash
 
-### Manual test plan
+### Manual test plan (against the desktop daemon)
 
-1. **Desktop → Phone**: Copy on desktop, verify appears on phone clipboard
-2. **Phone → Desktop**: Share text on phone, verify appears on desktop
-3. **Multi-device**: Desktop + 2 phones, verify convergence
-4. **Wi-Fi change**: Move between APs, verify reconnect
-5. **Screen off**: Wait 5 min, copy on desktop, wake phone, verify
-6. **Oversize**: Copy 1500 char text, verify toast warning
-7. **Wrong key**: Enter invalid key, verify service won't start
+Requires the desktop daemon on the same LAN with the same key.
+
+1. **Desktop → Phone (~100 KB)**: copy ~100 KB text on desktop, verify it appears on the phone clipboard and the status line shows the received size.
+2. **Desktop → Phone (~5 MB, refused)**: copy ~5 MB text on desktop, verify the phone shows "Text too large for the Android clipboard" in the status line and the clipboard is unchanged.
+3. **Phone → Desktop (share sheet, ~100 KB)**: select ~100 KB text on the phone → Share → "Clipcast Send", verify it appears on the desktop.
+4. **Wrong key**: enter a wrong key on the phone, copy on desktop, verify nothing arrives (and the daemon log shows auth failures, not crashes).
+5. **Wi-Fi change mid-transfer**: start a large (~5 MB, with raised max-apply for the test) desktop→phone transfer, roam to another AP mid-transfer, verify the phone reports a failed transfer and applies nothing; re-copying after roaming syncs.
+6. **Screen off**: turn the phone screen off, wait 5 min, copy ~100 KB on desktop, wake the phone, verify delivery or a failed-transfer status (Doze may delay it; retry with screen on).
+7. **Small-text regression**: copy short text both ways, verify instant sync as before.
+8. **Oversize send**: try to send > 16 MiB from the phone, verify the "too large" notice.
 
 ## Known Limitations
 
 - Background auto-send impossible on Android 10+ without privileged access
 - MulticastLock may not work on all OEM Wi-Fi implementations
 - Directed broadcast requires correct subnet mask from LinkProperties
-- No image/file support (v1 text only)
+- Fetched text over max applied size (default 512 KiB, max 900 KB) is refused (Binder limit)
+- Phone serves large-text fetches only while the foreground service is alive; Doze may delay or break transfers with the screen off
+- No image/file support (text only)
 - No QR code for key entry (manual paste only)
 
 ## License

@@ -5,6 +5,8 @@
     <string name="pref_key_summary">32-byte key as base64 from clipcast keygen</string>
     <string name="pref_port">UDP Port</string>
     <string name="pref_port_summary">Default 47474</string>
+    <string name="pref_tcp_port">TCP Port (large text)</string>
+    <string name="pref_max_apply">Max applied text, KiB (max 900)</string>
     <string name="pref_autostart">Autostart on boot</string>
     <string name="device_id_label">Device ID</string>
     <string name="status_stopped">Stopped</string>
@@ -13,6 +15,8 @@
     <string name="status_no_wifi">No Wi-Fi</string>
     <string name="last_rx">Last received: %1$s (%2$d bytes)</string>
     <string name="last_tx">Last sent: %1$s (%2$d bytes)</string>
+    <string name="tcp_listening">TCP: %1$s</string>
+    <string name="last_transfer">Last transfer: %1$s</string>
     <string name="never">never</string>
     <string name="btn_send_now">Send clipboard now</string>
     <string name="btn_start">Start</string>
