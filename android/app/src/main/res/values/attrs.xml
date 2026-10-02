@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Semantic surface/semaphore colors for the Clipcast UI. The theme
+         resolves them per mode (see values-night/colors.xml for dark). -->
+    <attr name="clipCardBackground" format="color" />
+    <attr name="clipStatusOk" format="color" />
+    <attr name="clipStatusWarn" format="color" />
+    <attr name="clipStatusError" format="color" />
+</resources>

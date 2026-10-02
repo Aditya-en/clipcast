@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Framework only: DeviceDefault.DayNight follows the system light/dark
+         setting and picks up dynamic Material You colors on Android 12+.
+         The explicit color/contrast items below are a restrained fallback
+         for older versions (plus a proper dark theme via values-night). -->
+    <style name="Theme.Clipcast" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <!-- Edge-to-edge: transparent bars, contrast enforced by padding. -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <!-- Our semantic colors. -->
+        <item name="clipCardBackground">@color/clip_card</item>
+        <item name="clipStatusOk">@color/clip_ok</item>
+        <item name="clipStatusWarn">@color/clip_warn</item>
+        <item name="clipStatusError">@color/clip_error</item>
+    </style>
+
+    <style name="Theme.Clipcast.Transparent" parent="android:Theme.Translucent.NoTitleBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+</resources>

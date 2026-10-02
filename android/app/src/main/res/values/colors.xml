@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Restrained fallback palette (light). On Android 12+ the
+         DeviceDefault parent applies dynamic Material You colors to
+         framework controls; these cover our own surfaces and status dots.
+         Text uses ?android:attr/textColorPrimary/Secondary (theme-adapted).
+         Status colors hold at least 4.5:1 against the card fill. -->
+    <color name="clip_card">#ECEEF3</color>
+    <color name="clip_ok">#1B6B32</color>
+    <color name="clip_warn">#7A4D00</color>
+    <color name="clip_error">#B3261E</color>
+</resources>

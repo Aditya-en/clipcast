@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hand-authored gear: hub + ring + 8 teeth. Fill is white; tint with
+     ?android:attr/textColorPrimary in the layout. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,10.2A1.8,1.8 0 1,0 12,13.8A1.8,1.8 0 1,0 12,10.2Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.4"
+        android:pathData="M12,7.4A4.6,4.6 0 1,0 12,16.6A4.6,4.6 0 1,0 12,7.4Z" />
+    <group
+        android:pivotX="12"
+        android:pivotY="12"
+        android:rotation="0">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M11.1,1.6h1.8v3.6h-1.8z" />
+    </group>
+    <group
+        android:pivotX="12"
+        android:pivotY="12"
+        android:rotation="45">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M11.1,1.6h1.8v3.6h-1.8z" />
+    </group>
+    <group
+        android:pivotX="12"
+        android:pivotY="12"
+        android:rotation="90">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M11.1,1.6h1.8v3.6h-1.8z" />
+    </group>
+    <group
+        android:pivotX="12"
+        android:pivotY="12"
+        android:rotation="135">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M11.1,1.6h1.8v3.6h-1.8z" />
+    </group>
+    <group
+        android:pivotX="12"
+        android:pivotY="12"
+        android:rotation="180">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M11.1,1.6h1.8v3.6h-1.8z" />
+    </group>
+    <group
+        android:pivotX="12"
+        android:pivotY="12"
+        android:rotation="225">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M11.1,1.6h1.8v3.6h-1.8z" />
+    </group>
+    <group
+        android:pivotX="12"
+        android:pivotY="12"
+        android:rotation="270">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M11.1,1.6h1.8v3.6h-1.8z" />
+    </group>
+    <group
+        android:pivotX="12"
+        android:pivotY="12"
+        android:rotation="315">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M11.1,1.6h1.8v3.6h-1.8z" />
+    </group>
+</vector>
