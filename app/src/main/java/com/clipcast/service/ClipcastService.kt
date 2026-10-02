@@ -18,6 +18,7 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.clipcast.ClipcastApplication
 import com.clipcast.R
 import com.clipcast.protocol.Crypto
+import com.clipcast.protocol.LargeTextLimits
 import com.clipcast.protocol.SyncState
 import com.clipcast.ui.MainActivity
 import com.clipcast.ui.SendActivity
@@ -26,8 +27,11 @@ import com.clipcast.util.Preferences
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.Socket
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 class ClipcastService : Service() {
     companion object {
@@ -45,6 +49,8 @@ class ClipcastService : Service() {
         const val EXTRA_LAST_RX_LEN = "extra_last_rx_len"
         const val EXTRA_LAST_TX_TIME = "extra_last_tx_time"
         const val EXTRA_LAST_TX_LEN = "extra_last_tx_len"
+        const val EXTRA_TCP_STATUS = "extra_tcp_status"
+        const val EXTRA_LAST_TRANSFER = "extra_last_transfer"
 
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "clipcast_sync"
@@ -71,6 +77,21 @@ class ClipcastService : Service() {
     private var lastAppliedTime: Long = 0
     private var messageTimestamps = mutableListOf<Long>()
     private val messageTimestampsLock = Any()
+
+    // Large-text side channel (v2).
+    private var transferStore: TransferStore? = null
+    private var tcpServer: TcpServer? = null
+    private var fetchExecutor = Executors.newFixedThreadPool(LargeTextLimits.MAX_CONCURRENT_FETCHES)
+    private val fetchLock = Any()
+    private var fetchGeneration = 0
+    private val activeFetches = mutableMapOf<Int, FetchHandle>()
+    private var tcpStatus: String = "TCP stopped"
+    private var lastTransfer: String = "none"
+
+    private class FetchHandle {
+        val cancel = AtomicBoolean(false)
+        val socketRef: AtomicReference<Socket?> = AtomicReference(null)
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -132,6 +153,34 @@ class ClipcastService : Service() {
         isRunning = true
         receiveThread = Thread(this::receiveLoop, "ClipcastReceive").apply { start() }
 
+        // Large-text side channel: serve our pending transfers over TCP.
+        // The listener only works while this service is alive (see README).
+        val store = TransferStore().also { transferStore = it }
+        val tcpPort = preferences?.tcpPort ?: LargeTextLimits.DEFAULT_TCP_PORT
+        val server = TcpServer(
+            tcpPort,
+            keyProvider = { preferences?.getKeyBytes() },
+            store = store,
+            listener = object : TcpServer.Listener {
+                override fun onListening(port: Int) {
+                    tcpStatus = "TCP listening on port $port"
+                    broadcastStatus()
+                }
+
+                override fun onError(message: String) {
+                    tcpStatus = message
+                    broadcastStatus()
+                }
+            },
+            log = { msg -> Log.d("ClipcastTcp", msg) }
+        )
+        tcpServer = server
+        tcpStatus = if (server.start()) {
+            "TCP listening on port ${server.localPort}"
+        } else {
+            "TCP port $tcpPort in use"
+        }
+
         startForeground(NOTIFICATION_ID, buildNotification())
         broadcastStatus()
     }
@@ -141,11 +190,18 @@ class ClipcastService : Service() {
 
         isRunning = false
 
+        cancelActiveFetches("service stopping")
+
         receiveThread?.interrupt()
         receiveThread = null
 
         receiveSocket?.close()
         receiveSocket = null
+
+        tcpServer?.stop()
+        tcpServer = null
+        transferStore = null
+        tcpStatus = "TCP stopped"
 
         multicastLock?.release()
         multicastLock = null
@@ -159,6 +215,18 @@ class ClipcastService : Service() {
             Thread.currentThread().interrupt()
         }
         sendExecutor = Executors.newSingleThreadExecutor()
+
+        fetchExecutor.shutdown()
+        try {
+            fetchExecutor.awaitTermination(5, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        fetchExecutor = Executors.newFixedThreadPool(LargeTextLimits.MAX_CONCURRENT_FETCHES)
+        synchronized(fetchLock) {
+            activeFetches.clear()
+            fetchGeneration = 0
+        }
 
         stopForeground(true)
         stopSelf()
@@ -174,7 +242,8 @@ class ClipcastService : Service() {
                 receiveSocket?.receive(packet)
                 val receivedLength = packet.length
                 val data = buffer.copyOfRange(0, receivedLength)
-                processReceivedPacket(data)
+                val source = packet.address
+                processReceivedPacket(data, source)
             } catch (e: java.net.SocketTimeoutException) {
             } catch (e: Exception) {
                 if (isRunning) {
@@ -184,17 +253,37 @@ class ClipcastService : Service() {
         }
     }
 
-    private fun processReceivedPacket(data: ByteArray) {
+    private fun processReceivedPacket(data: ByteArray, source: InetAddress? = null) {
         val keyBytes = preferences?.getKeyBytes() ?: return
-        val decoded = Crypto.decode(keyBytes, data) ?: return
+        // v1 small-text path first: behavior unchanged.
+        val decoded = Crypto.decode(keyBytes, data)
+        if (decoded != null) {
+            processV1Message(decoded)
+            return
+        }
+        // Large-text announce (content_type 0x80).
+        val announce = Crypto.decodeAnnounce(keyBytes, data) ?: return
+        if (source != null) {
+            processAnnounce(announce, source)
+        }
+    }
 
-        val now = System.currentTimeMillis()
+    /** Shared inbound rate limit: max 20 messages/second. */
+    private fun checkRateLimit(now: Long): Boolean {
         synchronized(messageTimestampsLock) {
             messageTimestamps.add(now)
             messageTimestamps.removeAll { now - it > 1000 }
             if (messageTimestamps.size > MAX_MESSAGES_PER_SECOND) {
-                return
+                return false
             }
+        }
+        return true
+    }
+
+    private fun processV1Message(decoded: Crypto.DecodedMessage) {
+        val now = System.currentTimeMillis()
+        if (!checkRateLimit(now)) {
+            return
         }
 
         val ourDeviceId = preferences?.deviceId ?: return
@@ -230,6 +319,165 @@ class ClipcastService : Service() {
         lastRxTime = System.currentTimeMillis()
         lastRxLen = decoded.payload.size
         broadcastStatus()
+    }
+
+    /**
+     * Large-text announce path (content_type 0x80). Runs the same ordering
+     * checks as v1 through [SyncState.onReceive]; when accepted,
+     * last_applied advances immediately, then the content is fetched over TCP
+     * from the announce's UDP source address on a worker thread.
+     */
+    private fun processAnnounce(announce: Crypto.DecodedAnnounce, source: InetAddress) {
+        val now = System.currentTimeMillis()
+        if (!checkRateLimit(now)) {
+            return
+        }
+
+        val ourDeviceId = preferences?.deviceId ?: return
+        if (announce.deviceId.contentEquals(ourDeviceId)) {
+            return
+        }
+
+        val shouldApply = syncState?.onReceive(announce.lamport, announce.deviceId) ?: false
+        if (!shouldApply) {
+            return
+        }
+        // Accepted: last_applied already advanced by onReceive.
+
+        val maxApply = (preferences?.maxApplyBytes
+            ?: LargeTextLimits.DEFAULT_MAX_APPLY_BYTES).toLong()
+        val announceHashHex = Crypto.bytesToHex(announce.sha256)
+        when (AnnouncePolicy.decide(
+            announce.totalLen, maxApply, announce.innerContentType,
+            announceHashHex, lastAppliedContentHash
+        )) {
+            AnnouncePolicy.Decision.SKIP_OVER_LIMIT -> {
+                Log.d("ClipcastService", "announce total_len ${announce.totalLen} exceeds max_apply $maxApply; skipping")
+                // Brief, non-intrusive notice via the status line (no toast storm).
+                lastTransfer =
+                    "Text too large for the Android clipboard (${announce.totalLen} bytes, max $maxApply)"
+                broadcastStatus()
+                return
+            }
+            AnnouncePolicy.Decision.SKIP_UNKNOWN_TYPE -> {
+                Log.d("ClipcastService", "ignoring announce with unknown inner_content_type ${announce.innerContentType}")
+                return
+            }
+            AnnouncePolicy.Decision.SKIP_DUPLICATE -> {
+                Log.d("ClipcastService", "ignoring announce matching already-applied content")
+                return
+            }
+            AnnouncePolicy.Decision.FETCH -> Unit
+        }
+
+        // A newer accepted message cancels an older fetch.
+        val handle = FetchHandle()
+        val generation = synchronized(fetchLock) {
+            cancelActiveFetchesLocked()
+            fetchGeneration += 1
+            activeFetches[fetchGeneration] = handle
+            fetchGeneration
+        }
+        try {
+            fetchExecutor.execute {
+                runFetch(generation, handle, announce, source, maxApply)
+            }
+        } catch (e: Exception) {
+            synchronized(fetchLock) { activeFetches.remove(generation) }
+            Log.w("ClipcastService", "fetch submit failed", e)
+        }
+    }
+
+    private fun runFetch(
+        generation: Int,
+        handle: FetchHandle,
+        announce: Crypto.DecodedAnnounce,
+        source: InetAddress,
+        maxApply: Long
+    ) {
+        try {
+            val keyBytes = preferences?.getKeyBytes()
+            val deviceId = preferences?.deviceId
+            if (keyBytes == null || deviceId == null) {
+                finishFetch(generation, "Transfer failed (no key)")
+                return
+            }
+            val params = TcpFetchClient.Params(
+                key = keyBytes,
+                clientDeviceId = deviceId,
+                serverAddress = source,
+                tcpPort = announce.tcpPort,
+                transferId = announce.transferId.copyOf(),
+                totalLen = announce.totalLen,
+                expectedSha256 = announce.sha256.copyOf(),
+                innerContentType = announce.innerContentType,
+                maxTransferBytes = maxApply,
+                totalTimeoutMs = LargeTextLimits.TOTAL_TIMEOUT_MS
+            )
+            val data = TcpFetchClient.fetch(params, handle.cancel, handle.socketRef)
+            // Discard if a newer message won while we were fetching.
+            synchronized(fetchLock) {
+                if (generation != fetchGeneration) {
+                    Log.d("ClipcastService", "fetch superseded by newer message; discarding")
+                    return
+                }
+            }
+            // Length, SHA-256, and strict UTF-8 already verified by the fetch.
+            // Only now touch the clipboard, on the main thread.
+            val text = String(data, java.nio.charset.StandardCharsets.UTF_8)
+            val now = System.currentTimeMillis()
+            lastAppliedContentHash = ClipboardHelper.contentHash(text)
+            lastAppliedTime = now
+            Looper.getMainLooper().let { mainLooper ->
+                android.os.Handler(mainLooper).post {
+                    try {
+                        ClipboardHelper.setText(this@ClipcastService, text)
+                    } catch (t: Throwable) {
+                        Log.w("ClipcastService", "setPrimaryClip failed", t)
+                    }
+                }
+            }
+            lastRxTime = System.currentTimeMillis()
+            lastRxLen = data.size
+            finishFetch(generation, "Received ${data.size} bytes")
+        } catch (e: TcpFetchClient.FetchException) {
+            if (e.kind == TcpFetchClient.FetchException.Kind.CANCELLED) {
+                Log.d("ClipcastService", "fetch cancelled (newer message accepted)")
+                synchronized(fetchLock) { activeFetches.remove(generation) }
+            } else {
+                Log.w("ClipcastService", "fetch failed: ${e.message}")
+                finishFetch(generation, "Transfer failed (${e.kind.name.lowercase()})")
+            }
+        } catch (e: Exception) {
+            Log.w("ClipcastService", "fetch failed", e)
+            finishFetch(generation, "Transfer failed (error)")
+        }
+    }
+
+    private fun finishFetch(generation: Int, transferStatus: String) {
+        synchronized(fetchLock) { activeFetches.remove(generation) }
+        lastTransfer = transferStatus
+        broadcastStatus()
+    }
+
+    private fun cancelActiveFetchesLocked() {
+        for ((_, handle) in activeFetches) {
+            handle.cancel.set(true)
+            try {
+                handle.socketRef.get()?.close()
+            } catch (e: Exception) {
+                // ignore: the fetch loop maps the closed socket to CANCELLED.
+            }
+        }
+        activeFetches.clear()
+    }
+
+    private fun cancelActiveFetches(reason: String) {
+        synchronized(fetchLock) {
+            if (activeFetches.isEmpty()) return
+            Log.d("ClipcastService", "cancelling fetches: $reason")
+            cancelActiveFetchesLocked()
+        }
     }
 
     fun sendText(text: String, quiet: Boolean = false) {
@@ -293,6 +541,8 @@ class ClipcastService : Service() {
         intent.putExtra(EXTRA_LAST_RX_LEN, lastRxLen)
         intent.putExtra(EXTRA_LAST_TX_TIME, lastTxTime)
         intent.putExtra(EXTRA_LAST_TX_LEN, lastTxLen)
+        intent.putExtra(EXTRA_TCP_STATUS, tcpStatus)
+        intent.putExtra(EXTRA_LAST_TRANSFER, lastTransfer)
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
 
