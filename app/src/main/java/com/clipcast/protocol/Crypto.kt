@@ -14,6 +14,18 @@ object Crypto {
     private const val MAX_DATAGRAM_SIZE = 1400
     private const val MAX_PAYLOAD_SIZE = 1200
 
+    /** content_type for the large-text UDP announce (v2 side channel). */
+    const val CONTENT_ANNOUNCE: Byte = 0x80.toByte()
+
+    /**
+     * Announce payload length: inner(1) + transfer_id(16) + total_len(8) +
+     * sha256(32) + tcp_port(2) = 59 bytes.
+     */
+    const val ANNOUNCE_PAYLOAD_LEN = 59
+
+    /** Inner content type for text/plain UTF-8 inside an announce. */
+    const val INNER_TEXT: Byte = 0x01
+
     private val secureRandom = SecureRandom()
 
     data class DecodedMessage(
@@ -24,6 +36,46 @@ object Crypto {
         val contentType: Byte,
         val payload: ByteArray
     )
+
+    /** A decoded large-text UDP announce (content_type 0x80). */
+    data class DecodedAnnounce(
+        val deviceId: ByteArray,
+        val nonce: ByteArray,
+        val lamport: Long,
+        val timestampMs: Long,
+        val innerContentType: Byte,
+        val transferId: ByteArray,
+        val totalLen: Long,
+        val sha256: ByteArray,
+        val tcpPort: Int
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is DecodedAnnounce) return false
+            return deviceId.contentEquals(other.deviceId) &&
+                nonce.contentEquals(other.nonce) &&
+                lamport == other.lamport &&
+                timestampMs == other.timestampMs &&
+                innerContentType == other.innerContentType &&
+                transferId.contentEquals(other.transferId) &&
+                totalLen == other.totalLen &&
+                sha256.contentEquals(other.sha256) &&
+                tcpPort == other.tcpPort
+        }
+
+        override fun hashCode(): Int {
+            var r = deviceId.contentHashCode()
+            r = 31 * r + nonce.contentHashCode()
+            r = 31 * r + lamport.hashCode()
+            r = 31 * r + timestampMs.hashCode()
+            r = 31 * r + innerContentType.hashCode()
+            r = 31 * r + transferId.contentHashCode()
+            r = 31 * r + totalLen.hashCode()
+            r = 31 * r + sha256.contentHashCode()
+            r = 31 * r + tcpPort
+            return r
+        }
+    }
 
     fun generateDeviceId(): ByteArray {
         val bytes = ByteArray(16)
@@ -119,6 +171,10 @@ object Crypto {
     }
 
     private fun buildBody(lamport: Long, timestampMs: Long, payload: ByteArray): ByteArray {
+        return buildBodyWithType(lamport, timestampMs, 0x01, payload)
+    }
+
+    private fun buildBodyWithType(lamport: Long, timestampMs: Long, contentType: Byte, payload: ByteArray): ByteArray {
         val body = ByteArray(8 + 8 + 1 + 4 + payload.size)
         var offset = 0
 
@@ -128,7 +184,7 @@ object Crypto {
         writeUint64(timestampMs, body, offset)
         offset += 8
 
-        body[offset] = 0x01
+        body[offset] = contentType
         offset += 1
 
         writeUint32(payload.size, body, offset)
@@ -137,6 +193,138 @@ object Crypto {
         payload.copyInto(body, offset)
 
         return body
+    }
+
+    /**
+     * Build the 59-byte announce payload:
+     * inner_content_type(1) || transfer_id(16) || total_len u64(8) ||
+     * sha256(32) || tcp_port u16(2). All integers big-endian.
+     */
+    fun encodeAnnouncePayload(
+        innerContentType: Byte,
+        transferId: ByteArray,
+        totalLen: Long,
+        sha256: ByteArray,
+        tcpPort: Int
+    ): ByteArray {
+        require(transferId.size == 16) { "transfer_id must be 16 bytes" }
+        require(sha256.size == 32) { "sha256 must be 32 bytes" }
+        require(tcpPort in 1..65535) { "tcp_port out of range" }
+        val buf = ByteArray(ANNOUNCE_PAYLOAD_LEN)
+        buf[0] = innerContentType
+        transferId.copyInto(buf, 1)
+        writeUint64(totalLen, buf, 17)
+        sha256.copyInto(buf, 25)
+        buf[57] = ((tcpPort ushr 8) and 0xFF).toByte()
+        buf[58] = (tcpPort and 0xFF).toByte()
+        return buf
+    }
+
+    /** Null unless [bytes] is exactly a 59-byte announce payload. */
+    fun decodeAnnouncePayload(bytes: ByteArray): DecodedAnnouncePayload? {
+        if (bytes.size != ANNOUNCE_PAYLOAD_LEN) return null
+        val transferId = bytes.copyOfRange(1, 17)
+        val totalLen = readUint64(bytes, 17)
+        val sha256 = bytes.copyOfRange(25, 57)
+        val tcpPort = ((bytes[57].toInt() and 0xFF) shl 8) or (bytes[58].toInt() and 0xFF)
+        if (tcpPort < 1 || tcpPort > 65535) return null
+        return DecodedAnnouncePayload(bytes[0], transferId, totalLen, sha256, tcpPort)
+    }
+
+    data class DecodedAnnouncePayload(
+        val innerContentType: Byte,
+        val transferId: ByteArray,
+        val totalLen: Long,
+        val sha256: ByteArray,
+        val tcpPort: Int
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is DecodedAnnouncePayload) return false
+            return innerContentType == other.innerContentType &&
+                transferId.contentEquals(other.transferId) &&
+                totalLen == other.totalLen &&
+                sha256.contentEquals(other.sha256) &&
+                tcpPort == other.tcpPort
+        }
+
+        override fun hashCode(): Int {
+            var r = innerContentType.hashCode()
+            r = 31 * r + transferId.contentHashCode()
+            r = 31 * r + totalLen.hashCode()
+            r = 31 * r + sha256.contentHashCode()
+            r = 31 * r + tcpPort
+            return r
+        }
+    }
+
+    /**
+     * Encode a large-text announce as a normal v1 UDP datagram (existing
+     * header, nonce, AES-GCM, body) with content_type 0x80 and the 59-byte
+     * announce payload. Null only on encryption failure (the 59-byte payload
+     * always fits the datagram).
+     */
+    fun encodeAnnounce(
+        key: ByteArray,
+        deviceId: ByteArray,
+        lamport: Long,
+        timestampMs: Long,
+        announcePayload: ByteArray,
+        nonce: ByteArray = generateNonce()
+    ): ByteArray? {
+        if (announcePayload.size != ANNOUNCE_PAYLOAD_LEN) return null
+        val header = buildHeader(deviceId, nonce)
+        val body = buildBodyWithType(lamport, timestampMs, CONTENT_ANNOUNCE, announcePayload)
+        val ciphertext = encrypt(key, nonce, header, body) ?: return null
+        val datagram = ByteArray(header.size + ciphertext.size)
+        System.arraycopy(header, 0, datagram, 0, header.size)
+        System.arraycopy(ciphertext, 0, datagram, header.size, ciphertext.size)
+        if (datagram.size > MAX_DATAGRAM_SIZE) return null
+        return datagram
+    }
+
+    /**
+     * Decode a large-text announce datagram. Null for non-announce messages
+     * (including v1 text), malformed framing, failed authentication, wrong
+     * payload length, or out-of-range port. v1 text behavior is unchanged:
+     * use [decode] for content_type 0x01.
+     */
+    fun decodeAnnounce(key: ByteArray, datagram: ByteArray): DecodedAnnounce? {
+        if (datagram.size < HEADER_SIZE + TAG_SIZE + 1) return null
+        val header = datagram.copyOfRange(0, HEADER_SIZE)
+        if (!Arrays.equals(header.copyOfRange(0, 4), "CCLP".toByteArray())) return null
+        if (header[4] != 1.toByte()) return null
+        if (header[5] != 0x01.toByte()) return null
+        val deviceId = header.copyOfRange(6, 22)
+        val nonce = header.copyOfRange(22, 34)
+        val ciphertext = datagram.copyOfRange(HEADER_SIZE, datagram.size)
+        val plaintext = decrypt(key, nonce, header, ciphertext) ?: return null
+        if (plaintext.size < 21) return null
+        var offset = 0
+        val lamport = readUint64(plaintext, offset)
+        offset += 8
+        val timestampMs = readUint64(plaintext, offset)
+        offset += 8
+        if (plaintext[offset] != CONTENT_ANNOUNCE) return null
+        offset += 1
+        if (plaintext.size < offset + 4) return null
+        val payloadLen = readUint32(plaintext, offset)
+        offset += 4
+        if (plaintext.size != offset + payloadLen) return null
+        if (payloadLen != ANNOUNCE_PAYLOAD_LEN) return null
+        val payload = plaintext.copyOfRange(offset, offset + payloadLen)
+        val parsed = decodeAnnouncePayload(payload) ?: return null
+        return DecodedAnnounce(
+            deviceId = deviceId,
+            nonce = nonce,
+            lamport = lamport,
+            timestampMs = timestampMs,
+            innerContentType = parsed.innerContentType,
+            transferId = parsed.transferId,
+            totalLen = parsed.totalLen,
+            sha256 = parsed.sha256,
+            tcpPort = parsed.tcpPort
+        )
     }
 
     private fun encrypt(key: ByteArray, nonce: ByteArray, aad: ByteArray, plaintext: ByteArray): ByteArray? {
