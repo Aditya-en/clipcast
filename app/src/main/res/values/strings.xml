@@ -23,6 +23,7 @@
     <string name="key_helper">Paste the contents of ~/.config/clipcast/key from your computer.</string>
     <string name="key_paste_fail">Couldn\'t read the clipboard</string>
     <string name="max_apply_title">Max pasted text size · %1$s</string>
+    <string name="max_apply_title_simple">Max pasted text size</string>
     <string name="max_apply_helper">Android can\'t paste very large text.</string>
     <string name="device_tap_to_copy">Tap to copy the full ID</string>
     <string name="advanced_show">Show advanced settings</string>
@@ -86,6 +87,7 @@
     <string name="notification_title">Clipcast is syncing</string>
     <string name="notification_text_waiting">Waiting for Wi-Fi</string>
     <string name="notification_action_send">Send clipboard</string>
+    <string name="notification_action_stop">Stop</string>
     <string name="notification_channel_id">clipcast_sync</string>
     <string name="notification_channel_name">Clipcast Sync</string>
     <string name="notification_channel_desc">Foreground service for LAN clipboard sync</string>

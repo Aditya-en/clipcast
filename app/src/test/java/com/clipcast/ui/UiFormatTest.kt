@@ -47,6 +47,12 @@ class UiFormatTest {
     }
 
     @Test
+    fun humanSize_negativeClamps() {
+        assertEquals("0 B", UiFormat.humanSize(-1))
+        assertEquals("0 bytes", UiFormat.talkSize(-5))
+    }
+
+    @Test
     fun shortId_truncates() {
         assertEquals("a3f109cc", UiFormat.shortId("a3f109cc00112233"))
         assertEquals("abc", UiFormat.shortId("abc"))

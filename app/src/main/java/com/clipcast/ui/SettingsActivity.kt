@@ -180,6 +180,7 @@ class SettingsActivity : Activity() {
     private fun setupBehaviorSection() {
         bootSwitch = findViewById(R.id.bootSwitch)
         bootSwitch.isChecked = preferences?.autostart == true
+        bootSwitch.contentDescription = getString(R.string.pref_autostart)
         bootSwitch.setOnCheckedChangeListener { _, isChecked ->
             preferences?.autostart = isChecked
             updateBootReceiver(isChecked)
@@ -230,6 +231,8 @@ class SettingsActivity : Activity() {
         deviceIdFull = Crypto.bytesToHex(preferences?.deviceId ?: ByteArray(16))
         deviceIdShort = UiFormat.shortId(deviceIdFull) + " · " + getString(R.string.device_tap_to_copy)
         deviceIdValue.text = deviceIdShort
+        deviceIdValue.contentDescription =
+            "Device ID ${UiFormat.shortId(deviceIdFull)}. ${getString(R.string.device_tap_to_copy)}."
         deviceIdValue.setOnClickListener {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("clipcast device id", deviceIdFull))

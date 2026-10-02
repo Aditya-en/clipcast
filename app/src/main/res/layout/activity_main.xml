@@ -66,10 +66,13 @@
                 android:contentDescription="@null" />
 
             <LinearLayout
+                android:id="@+id/statusTextColumn"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
+                android:minHeight="48dp"
                 android:layout_weight="1"
-                android:orientation="vertical">
+                android:orientation="vertical"
+                android:gravity="center_vertical">
 
                 <TextView
                     android:id="@+id/statusTitle"
@@ -176,7 +179,8 @@
                     android:layout_height="wrap_content"
                     android:minHeight="48dp"
                     android:textAllCaps="false"
-                    style="?android:attr/borderlessButtonStyle" />
+                    style="?android:attr/borderlessButtonStyle"
+                android:textColor="?android:attr/textColorPrimary" />
 
                 <Button
                     android:id="@+id/hintDismiss"
@@ -185,7 +189,8 @@
                     android:minHeight="48dp"
                     android:text="@string/hint_dismiss"
                     android:textAllCaps="false"
-                    style="?android:attr/borderlessButtonStyle" />
+                    style="?android:attr/borderlessButtonStyle"
+                android:textColor="?android:attr/textColorPrimary" />
             </LinearLayout>
         </LinearLayout>
 

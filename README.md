@@ -78,13 +78,57 @@ Works in background via foreground service. Remote text appears in clipboard aut
 
 ## Settings
 
-| Setting | Default | Notes |
-|---------|---------|-------|
-| UDP port | 47474 | Must match the daemon's UDP port |
-| TCP port | 47475 | Our listener; peers learn it from our announces |
-| Max applied text | 512 KiB | Cap on fetched text applied to the clipboard; hard-capped at 900 KB |
+All set-once values live on a separate Settings screen (gear icon); changes
+apply immediately when valid, and an invalid field never overwrites storage.
+
+| Section | Contents |
+|---------|----------|
+| Encryption | Key field (masked, Show/Hide, Paste), live validation ("Valid · 256-bit key"), helper pointing at `~/.config/clipcast/key` |
+| Behavior | Boot start switch; max pasted text presets (64 / 256 / 512 / 900 KB) |
+| Device | Device model; shortened device ID, tap copies the full ID |
+| Advanced (collapsed) | UDP + TCP ports (1024–65535, must differ), restore defaults; changing a port while sync is on restarts the service |
+| About | App version; "protocol v1 + TCP v1" |
 
 **Firewall implications (desktop side):** the desktop daemon must be reachable from the phone — allow inbound UDP on its UDP port *and* inbound TCP on its `tcp_port` in the desktop firewall. In the other direction, LAN peers must be able to open TCP to the phone's TCP port: guest Wi-Fi networks with client isolation, or Android hotspot/Tethering setups that block inbound connections, will break phone→desktop large sends (small UDP text may still work). If large sends fail while small text syncs, check isolation/firewall first.
+
+## User interface
+
+Native framework widgets and `Theme.DeviceDefault.DayNight` only (dynamic
+Material You colors on Android 12+, restrained light/dark fallback below).
+No AppCompat, Material library, Compose, or third-party UI code. Edge-to-edge
+with correct insets (status/nav bars, cutout, keyboard); content capped at
+560dp and centered; everything scrolls. Clipboard content is never shown —
+sizes and times only.
+
+Screens (verified on a physical tablet via screenshots; light theme and
+200% font scale reviewed by code inspection only):
+
+- **Main**: "Clipcast" title + gear. Status card with dot + plain words
+  ("Sync is on", "Sync is off", "Waiting for Wi-Fi", "Needs setup: add
+  your key", or a red reason with "Fix in Settings") plus the master
+  switch; the second line shows the local IP (tap copies it) and Wi-Fi
+  state. Activity card with Received/Sent rows (relative time, human
+  size, check/cross, plain-words failure line) or "Nothing yet…". One
+  full-width "Send clipboard now" button, disabled with a reason when it
+  can't send, flashing "Sent · 812 B" briefly after a tap.
+- **First run**: with no key saved, the status card says "Needs setup"
+  and a card walks through `clipcast keygen` → copy → "Paste key from
+  clipboard", which validates, saves, and starts sync.
+- **Hints**: at most one dismissible card above Activity — notification
+  permission denied (opens system settings) or battery optimization
+  limiting the app.
+- **Settings**: Encryption (masked key, Show/Hide, Paste, live
+  validation), Behavior (boot switch, 64–900 KB presets), Device
+  (model, short ID, tap-to-copy full ID), collapsed Advanced (ports +
+  restore defaults), About (version, protocol line).
+- **Notification**: "Clipcast is syncing" + local IP, Send and Stop
+  actions, tap opens the app. The Quick Settings tile mirrors the sync
+  state ("Sync is on/off").
+
+Accessibility: 48dp targets, content descriptions on all icon buttons,
+status text as a live region, Activity rows read as one TalkBack
+sentence, animations skipped when the system animator scale is 0,
+state survives rotation and process death.
 
 ## Android Clipboard Limitations
 
@@ -101,20 +145,23 @@ Works in background via foreground service. Remote text appears in clipboard aut
 ## Architecture
 
 ```
-MainActivity (UI) ←→ LocalBroadcastManager ←→ ClipcastService (Foreground)
-                                                     ↓
-                         NetworkManager ←→ DatagramSocket (UDP recv loop)
-                                                     ↓
-                         SyncState (Lamport) + Crypto (AES-GCM)
+MainActivity ←→ ServiceStateHolder ←→ ClipcastService (Foreground)
+     ↓                                        ↓
+StatusMapper/UiFormat             NetworkManager ←→ DatagramSocket (UDP)
+(pure, tested)                               ↓
+                                 SyncState (Lamport) + Crypto (AES-GCM)
                                                      ↓
                     Large text: AnnouncePolicy → TcpFetchClient (2-thread pool)
                                 TransferStore ← TcpServer (ServerSocket + pool of 4)
 ```
 
-- **MainActivity**: Settings (key, UDP/TCP ports, max applied text), status incl. TCP state + last transfer, manual send button
+- **MainActivity**: "Is it working?" status card (dot + plain words + switch), Activity card (sizes/times only), one send button, first-run card, dismissible hints
+- **SettingsActivity**: grouped settings with inline validation (no Save button)
+- **ServiceStateHolder**: in-process snapshot/event bus (main-thread delivery, cached for rotation/process death); replaces the deprecated LocalBroadcastManager
+- **StatusMapper / UiFormat / SettingsValidation**: pure UI logic, JVM unit-tested
 - **SendActivity**: Transparent activity for Share/QS tile/notification action
 - **ClipcastService**: UDP receive, decrypt, apply to clipboard, send queue; announce handling + fetch pool + TCP listener lifecycle
-- **NetworkManager**: Computes directed broadcast address from LinkProperties, tracks network changes
+- **NetworkManager**: Directed broadcast + local IPv4 from LinkProperties, tracks Wi-Fi connect/loss
 - **SyncState**: Lamport clock + device ID tiebreak (identical to desktop)
 - **Crypto**: AES-256-GCM with header as AAD; 0x80 announce encode/decode (v1 path unchanged)
 - **TcpCrypto**: HKDF-SHA256, CCLT header, handshake tag, frame seal/open, reassembly + content verification (pure JVM, unit-tested against the desktop vectors)

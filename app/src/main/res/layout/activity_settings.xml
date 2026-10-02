@@ -86,7 +86,8 @@
                     android:minHeight="48dp"
                     android:text="@string/key_show"
                     android:textAllCaps="false"
-                    style="?android:attr/borderlessButtonStyle" />
+                    style="?android:attr/borderlessButtonStyle"
+                android:textColor="?android:attr/textColorPrimary" />
 
                 <Button
                     android:id="@+id/keyPasteButton"
@@ -96,7 +97,8 @@
                     android:minHeight="48dp"
                     android:text="@string/key_paste"
                     android:textAllCaps="false"
-                    style="?android:attr/borderlessButtonStyle" />
+                    style="?android:attr/borderlessButtonStyle"
+                android:textColor="?android:attr/textColorPrimary" />
             </LinearLayout>
 
             <TextView
@@ -175,7 +177,8 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:minHeight="48dp"
-                android:max="3" />
+                android:max="3"
+                android:contentDescription="@string/max_apply_title_simple" />
 
             <TextView
                 android:layout_width="match_parent"
@@ -249,7 +252,8 @@
                 android:minHeight="48dp"
                 android:text="@string/advanced_show"
                 android:textAllCaps="false"
-                style="?android:attr/borderlessButtonStyle" />
+                style="?android:attr/borderlessButtonStyle"
+                android:textColor="?android:attr/textColorPrimary" />
 
             <LinearLayout
                 android:id="@+id/advancedGroup"
@@ -299,7 +303,8 @@
                     android:minHeight="48dp"
                     android:text="@string/ports_defaults"
                     android:textAllCaps="false"
-                    style="?android:attr/borderlessButtonStyle" />
+                    style="?android:attr/borderlessButtonStyle"
+                android:textColor="?android:attr/textColorPrimary" />
 
                 <TextView
                     android:id="@+id/portsNote"

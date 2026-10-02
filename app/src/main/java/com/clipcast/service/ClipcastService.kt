@@ -621,7 +621,15 @@ class ClipcastService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        // Low priority, ongoing, quiet: title + local IP, one action.
+        val stopIntent = Intent(this, ClipcastService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPendingIntent = PendingIntent.getService(
+            this, 2, stopIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        // Low priority, ongoing, quiet: title + local IP, Send + Stop.
         // Tapping the notification opens the main screen.
         val ip = networkManager?.getLocalIpv4()
         // Framework builder (minSdk 26: channels exist, no compat needed).
@@ -637,6 +645,15 @@ class ClipcastService : Service() {
                     ),
                     getString(R.string.notification_action_send),
                     sendPendingIntent
+                ).build()
+            )
+            .addAction(
+                android.app.Notification.Action.Builder(
+                    android.graphics.drawable.Icon.createWithResource(
+                        this, android.R.drawable.ic_menu_close_clear_cancel
+                    ),
+                    getString(R.string.notification_action_stop),
+                    stopPendingIntent
                 ).build()
             )
             .setOngoing(true)

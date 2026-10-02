@@ -109,6 +109,11 @@ class MainActivity : Activity() {
         statusCard = findViewById(R.id.statusCard)
         statusDot = findViewById(R.id.statusDot)
         statusTitle = findViewById(R.id.statusTitle)
+        findViewById<View>(R.id.statusTextColumn).setOnClickListener {
+            // Full-height tap target for copying the IP (bigger than the
+            // sub line itself). Only armed while an IP is showing.
+            currentIpLine?.let { copyIp(it) }
+        }
         statusSub = findViewById(R.id.statusSub)
         serviceSwitch = findViewById(R.id.serviceSwitch)
         emptyView = findViewById(R.id.emptyView)

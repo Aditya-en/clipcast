@@ -125,6 +125,30 @@ class StatusMapperTest {
     }
 
     @Test
+    fun error_beatsWaitingForWifi() {
+        // An actionable bind failure outranks the waiting state.
+        val st = StatusMapper.mapStatus(
+            base().copy(wifiConnected = false, tcpError = "TCP port 47475 in use")
+        )
+        assertTrue(st is StatusMapper.MainStatus.Error)
+    }
+
+    @Test
+    fun error_unknownReasonPassesThrough() {
+        val st = StatusMapper.mapStatus(
+            base().copy(running = false, udpError = "Something broke")
+        )
+        assertTrue(st is StatusMapper.MainStatus.Error)
+        assertEquals("Something broke", (st as StatusMapper.MainStatus.Error).reason)
+    }
+
+    @Test
+    fun unknownTransferDetailHidden() {
+        assertNull(StatusMapper.receiveFailureDetail("none"))
+        assertNull(StatusMapper.receiveFailureDetail("Received 100 bytes"))
+    }
+
+    @Test
     fun sendButton_disabledWithReason() {
         val noKey = StatusMapper.map(base().copy(configured = false))
         assertFalse(noKey.sendEnabled)
