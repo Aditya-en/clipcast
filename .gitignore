@@ -14,3 +14,6 @@ local.properties
 *.keystore
 *.p12
 .env
+
+# Local release artifacts (binaries, keystore-adjacent files)
+/releases/
