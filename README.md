@@ -4,11 +4,14 @@ A small LAN clipboard sync daemon for Linux desktops. Each device runs the
 same service: it watches the local text clipboard, broadcasts changes over
 UDP to the local network, and applies packets received from peers. Content
 is encrypted and authenticated with a shared key (AES-256-GCM). Plain text
-only, X11 and Wayland, one binary.
+only, X11 and Wayland, one binary. Text past the inline limit syncs over an
+encrypted TCP side channel (announce + fetch, protocol v2 below).
 
-A Kotlin Android client targets the same wire protocol (section
-[Wire protocol v1](#wire-protocol-v1)); the byte-level contract lives in
-this README and [`docs/test-vectors.md`](docs/test-vectors.md).
+A Kotlin Android client targets the same wire protocols (sections
+[Wire protocol v1](#wire-protocol-v1) and
+[Large-text transfer v2](#large-text-transfer-v2)); the byte-level contracts
+live in this README and [`docs/test-vectors.md`](docs/test-vectors.md) /
+[`docs/test-vectors-v2.md`](docs/test-vectors-v2.md).
 
 ## Quick start
 
@@ -29,13 +32,19 @@ cargo build --release
 ```
 
 Two devices sync as soon as both are running and can reach each other's
-broadcasts on UDP port 47474.
+broadcasts on UDP port 47474. Large texts additionally need TCP port 47475
+reachable between the machines (see [Large-text transfer](#large-text-transfer-v2)
+and [Troubleshooting](#troubleshooting)).
 
 ## Architecture
 
 ```
 proto      wire format encode/decode (pure functions, no I/O)
 crypto     AES-256-GCM seal/open, key/device-id handling
+tcp        v2 TCP session protocol: header, HKDF key, frames, reassembly
+transfer   pending outbound large-text store (TTL, caps, fetch budgets)
+tcp_server TCP listener serving pending transfers (sync workers)
+fetch      TCP fetch client (timeouts, strict validation, cancellation)
 engine     sync state machine, generic over two traits:
              ClipboardBackend { get_text, set_text, subscribe_changes }
              Transport        { send, recv }
@@ -98,23 +107,122 @@ base64.
 Receive rules: silently drop (log at debug) wrong magic, unsupported
 version, failed tag, invalid UTF-8, or `payload_len` inconsistent with the
 datagram. Unknown `content_type` is ignored. Nothing panics on malformed
-input. Oversize local text is not sent (warning with length only; TCP fetch
-is a marked v2 extension point).
+input. Local text at or below the inline limit (`inline_max_bytes`,
+default 1200) sends exactly as above; larger text (up to
+`max_transfer_bytes`, default 64 MiB) sends as a v2 announce instead (next
+section); larger text is not sent (warning with length only).
 
 Cross-implementation test vectors (fixed key/nonce/device_id → exact
 datagram hex) are in `docs/test-vectors.md`, asserted by a unit test. The
 Android client should verify against that file first.
 
+## Large-text transfer v2
+
+Text longer than the UDP limit syncs via announce + TCP fetch. The sender
+keeps the plaintext in a pending-transfer store (newest 4 transfers, 128 MiB
+global cap, 120 s TTL, each fetchable up to 16 times) and serves it on TCP
+port **47475** (configurable) bound to 0.0.0.0 for the daemon's lifetime.
+
+Sender: text longer than `inline_max_bytes` but within `max_transfer_bytes`
+registers a pending transfer (`transfer_id` = 16 random bytes) and broadcasts
+one UDP announce. The receiver validates the announce through the same UDP
+checks and ordering rule, then fetches the bytes over TCP.
+
+### UDP announce
+
+A normal v1 UDP message (existing header, nonce, AES-GCM, body layout) with
+content_type = `0x80` and this 59-byte payload (all integers big-endian):
+
+| size | field              | notes                                    |
+|-----:|--------------------|------------------------------------------|
+|    1 | inner_content_type | `0x01` = text/plain UTF-8 (others: ignore the announce; reserved for images/files later) |
+|   16 | transfer_id        | random per transfer                      |
+|    8 | total_len          | plaintext bytes (u64)                    |
+|   32 | sha256             | SHA-256 of the plaintext content bytes   |
+|    2 | tcp_port           | sender's TCP port (u16)                  |
+
+The announce's lamport field is the message's lamport as usual: an accepted
+announce advances `last_applied` immediately, exactly like a v1 message.
+Over-limit announces, announces matching the local clipboard hash, and
+announces with unknown inner types are not fetched. A newer accepted message
+(announce or inline) cancels an in-flight older fetch; at most 2 fetches run
+at once.
+
+### TCP session
+
+Magic `CCLT` identifies TCP traffic; separate protocol, version 1. The
+receiver dials **only** the announce datagram's UDP source IP at the
+announce's `tcp_port` — never any address from inside the payload.
+
+Client request header (70 bytes, sent in the clear, used as AEAD AAD):
+
+| size | field            | value                        |
+|-----:|------------------|------------------------------|
+|    4 | magic            | ASCII `CCLT`                 |
+|    1 | version          | `1`                          |
+|    1 | msg_type         | `0x01` = FETCH               |
+|   16 | client_device_id | receiver's device id         |
+|   16 | transfer_id      | from the announce            |
+|   32 | client_nonce     | random per connection        |
+
+Session key (32 bytes): HKDF-SHA256 (RFC 5869) with IKM = the shared
+32-byte clipcast key, salt = `client_nonce`, info = ASCII
+`clipcast tcp v1` followed by the 16 `transfer_id` bytes.
+
+AEAD nonces (12 bytes): byte 0 = direction (`0x00` client-to-server, `0x01`
+server-to-client), bytes 1..3 = zero, bytes 4..11 = u64 frame counter
+(big-endian), starting at 0 per direction. Each connection has its own
+session key, so nonce reuse across connections is impossible. AAD for every
+sealed frame in both directions = the 70-byte request header.
+
+Handshake: right after the header the client sends one sealed frame —
+AES-256-GCM of the empty plaintext with direction `0x00`, counter 0 (exactly
+a 16-byte tag, no length prefix). The server reads exactly 70 + 16 bytes
+(3 s deadline), derives the key, verifies the tag, looks up the transfer,
+and only then starts sending. On ANY failure (bad magic, version, tag,
+unknown/expired/exhausted transfer, deadline) it closes silently with no
+response and allocates nothing proportional to attacker input.
+
+Server data frames (direction `0x01`, counters 0, 1, 2, …): `len` u32 =
+ciphertext length including the 16-byte tag (rejected if over
+65536 + 1 + 16), then the ciphertext of `flags` (u8) + up to 65536 data
+bytes. Flag bit 0 = FINAL (last frame); other bits must be zero. Frames carry
+65536 data bytes except the last, which carries FINAL (an empty final frame
+covers exact multiples of 65536 and empty content). The client requires
+exactly one FINAL, nothing after it (server closes), total data bytes ==
+`total_len`, matching SHA-256, and valid UTF-8 for inner type `0x01` —
+anything else aborts with nothing applied.
+
+Limits/timeouts: connect 3 s, 10 s idle between frames, overall
+`fetch_timeout_secs` (default 120); at most 8 concurrent server connections
+(extras closed immediately); each transfer served at most 16 times.
+
+Byte-exact vectors for a fixed key/ids/nonce/payload (announce payload,
+header, session key, handshake tag, first and final frames) are in
+`docs/test-vectors-v2.md`, asserted by a unit test.
+
 ## Security model and limits — read this
 
-- **No forward secrecy.** One long-term symmetric key encrypts everything.
+- **No forward secrecy.** One long-term symmetric key encrypts everything,
+  on UDP and on TCP. Anyone holding the key file can read and inject
+  clipboard content on your LAN, forever, for that key.
+- **TCP content is encrypted and authenticated** with per-connection keys
+  derived from the shared key (HKDF-SHA256 over a fresh 32-byte client
+  nonce): an attacker without the key can neither fetch transfers nor
+  inject frames. Replaying a captured request only yields the same
+  ciphertext back; without the key it decrypts to nothing.
+- **Metadata is visible on the wire:** packet sizes, timing, the 16-byte
+  device_id of every sender, transfer sizes, and the fact a transfer
+  happened. The announce hash and length ride inside the encrypted UDP
+  body; the TCP header (magic, device ids, transfer id) is cleartext.
+  Content itself is not visible.
 - **Replay of the latest packet is a no-op** (Lamport/tuple ordering
   rejects it), but an attacker who captured older distinct content can
-  replay *that* packet and win if no newer change happened since.
+  replay *that* packet and win if no newer change happened since. The same
+  holds for captured announces (a replayed announce only re-triggers a
+  fetch of content the sender still holds).
 - **Key compromise is total compromise.** Anyone holding the key can read
   and inject clipboard content on your LAN, forever, for that key.
-- **Metadata is visible on the wire:** packet sizes, timing, and the
-  16-byte device_id of every sender. Content is not.
 - Clipboard content never appears in logs by default (only length and a
   short hash prefix). `--log-content` disables that protection — debug use
   only.
@@ -127,7 +235,10 @@ Android client should verify against that file first.
   (`skip_sensitive = true`, default). The polling backend cannot see MIME
   types, so it cannot detect this — one more reason it is a fallback.
 - v1 syncs plain text only. Images, files, rich text are out of scope;
-  image/announce content types are reserved in the protocol but ignored.
+  `0x02` (image) is reserved and ignored. Large text uses the v2
+  announce + TCP fetch above; the inner content-type field leaves room for
+  images/files later. No compression, no resumable transfers, no relays,
+  no TLS.
 
 ## Configuration
 
@@ -135,7 +246,12 @@ Android client should verify against that file first.
 
 ```toml
 port = 47474
-max_text_bytes = 1200
+max_text_bytes = 1200   # legacy inline limit; inline_max_bytes wins if set
+inline_max_bytes = 1200 # text at/below this sends inline (UDP)
+max_transfer_bytes = 67108864  # 64 MiB: larger local text is never sent
+tcp_port = 47475        # large-text TCP listener + advertised port
+transfer_ttl_secs = 120 # pending transfers stay fetchable this long
+fetch_timeout_secs = 120# overall cap for one incoming TCP fetch
 poll_interval_ms = 300     # polling backend only
 skip_sensitive = true
 backend = "auto"           # "auto" | "x11" | "wayland" | "polling"
@@ -188,6 +304,11 @@ installed elsewhere.
     `sudo ufw allow 47474/udp` or
     `sudo nft add rule inet filter input udp dport 47474 accept`.
     Repeat on **both** machines.
+  - Firewall (large text): allow the TCP port too (default 47475), e.g.
+    `sudo ufw allow 47475/tcp` or
+    `sudo nft add rule inet filter input tcp dport 47475 accept`.
+    Without it, short texts sync but anything over the inline limit stays
+    local (fetch timeouts in the log). Repeat on **both** machines.
   - AP/client isolation: many Wi-Fi networks and guest networks block
     client-to-client traffic ("AP isolation", "client isolation", "peer
     isolation"). Disable it for your network, or test first with a cable /
@@ -225,25 +346,49 @@ installed elsewhere.
    # own-device packets ignored; no repeats after a second.
    ```
 
-2. **Two real machines:** install on both, place the same key file, run
-   (or enable the user service) on both, copy text on A, paste on B, then
-   the reverse. Confirm `doctor` output on both shows reachable broadcast
-   addresses on the same subnet.
+ 2. **Two real machines:** install on both, place the same key file, run
+    (or enable the user service) on both, copy text on A, paste on B, then
+    the reverse. Confirm `doctor` output on both shows reachable broadcast
+    addresses on the same subnet.
+
+ 3. **Large text, one machine** (TCP side channel, packet path, ordering,
+    no loops): with two instances as in (1) (same key, `RUST_LOG=debug`),
+    copy ~5 MB of text (e.g. `python3 -c "print('x'*5_000_000)" | wl-copy`).
+    The sender log shows one announce broadcast; the receiver log shows the
+    fetch completing and one "applied fetched transfer"; pasting yields the
+    full text on both; no rebroadcast appears in either log. Note: both
+    instances share TCP 47475, so only the instance that bound it serves —
+    large texts copied on the *other* instance will not be fetchable in
+    this setup. Use distinct `tcp_port` values in the two config files for
+    full two-way large-text testing on one machine.
+
+ 4. **Large text, two real machines:** with the daemon running on both and
+    TCP 47475 open both ways, copy ~5 MB on A, paste on B, then the reverse.
+    Confirm `doctor` on both reports the TCP listener and matching ports.
 
 ## Testing status
 
 `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`
-are clean. Unit tests cover proto round-trip and malformed input, crypto
-tampering, the documented test vector, engine behaviors (a)–(g) from the
-spec against fakes, interface discovery/filtering, transport loopback,
-config/keys/paths, backend planning, MIME/hint parsing.
+are clean. Unit tests cover proto round-trip and malformed input (v1 + v2
+announce), crypto tampering, both documented test-vector files, HKDF
+(RFC 5869 case 1), TCP frame sealing/opening and reassembly violations
+(truncated stream, missing FINAL, data after FINAL, wrong length/hash),
+silent-drop of unauthenticated TCP connections, the transfer store
+caps/TTL/budgets, engine behaviors (a)–(h) against fakes (large-text
+announce, exactly-one-fetch, apply-without-rebroadcast, stale/duplicate
+suppression, fetch cancellation, over-limit and same-hash skips, failed
+fetch applies nothing), interface discovery/filtering, UDP loopback with
+source capture, config/keys/paths, backend planning, MIME/hint parsing.
 
 Integration tests (`clipboard::gui_tests`) run against the real session:
 Wayland set/observe including the password-manager hint, X11 XFixes
 observation plus selection serving, and the polling backend. They skip
-themselves when no display is reachable.
+themselves when no display is reachable. A loopback integration test moves
+5 MB of text through the real TCP server + fetch client with fake
+clipboards (no display needed).
 
-Ran here: the two-instance one-machine manual test above (verified
-broadcast delivery, apply, echo suppression, own-device filtering, SIGINT
-shutdown). Not run here: the two-physical-machines test (no second machine
-in this environment).
+Ran here: the two-instance one-machine manual tests for small text
+(verified broadcast delivery, apply, echo suppression, own-device
+filtering, SIGINT shutdown), plus the automated 5 MB loopback test.
+Not run here: the two-physical-machines tests (no second machine in this
+environment) — items 2 and 4 above still need real hardware.

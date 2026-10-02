@@ -88,6 +88,29 @@ pub fn report(cfg: &Config, config_path: &Path) -> String {
         cfg.port, cfg.max_text_bytes, cfg.poll_interval_ms, cfg.skip_sensitive
     ));
     out.push_str(&format!(
+        "  transfer:       tcp_port={} inline_max_bytes={} (effective) max_transfer_bytes={} transfer_ttl_secs={} fetch_timeout_secs={}\n",
+        cfg.tcp_port,
+        cfg.effective_inline_max_bytes(),
+        cfg.max_transfer_bytes,
+        cfg.transfer_ttl_secs,
+        cfg.fetch_timeout_secs
+    ));
+    if crate::tcp_server::can_bind(cfg.tcp_port) {
+        out.push_str(&format!(
+            "  tcp_listener:   0.0.0.0:{} is free (daemon not holding it)\n",
+            cfg.tcp_port
+        ));
+    } else {
+        out.push_str(&format!(
+            "  tcp_listener:   0.0.0.0:{} is in use (daemon already running, or another process holds it)\n",
+            cfg.tcp_port
+        ));
+    }
+    out.push_str(&format!(
+        "  firewall:       peers need TCP {} as well as UDP {} (e.g. `sudo ufw allow {}/tcp`)\n",
+        cfg.tcp_port, cfg.port, cfg.tcp_port
+    ));
+    out.push_str(&format!(
         "  device_name:    {} (informational)\n",
         cfg.device_name
     ));

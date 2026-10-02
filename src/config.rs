@@ -7,6 +7,12 @@ use serde::Deserialize;
 pub const DEFAULT_PORT: u16 = 47474;
 pub const DEFAULT_MAX_TEXT_BYTES: usize = 1200;
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 300;
+/// v2 defaults: inline ceiling, per-transfer ceiling, TCP port, TTLs.
+pub const DEFAULT_TCP_PORT: u16 = 47475;
+pub const DEFAULT_INLINE_MAX_BYTES: usize = 1200;
+pub const DEFAULT_MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_TRANSFER_TTL_SECS: u64 = 120;
+pub const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 120;
 
 /// Clipboard backend selection. `Auto` picks from the session environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -24,6 +30,17 @@ pub enum BackendOverride {
 pub struct Config {
     pub port: u16,
     pub max_text_bytes: usize,
+    /// v2 inline ceiling. `None` (the default) falls back to the legacy
+    /// `max_text_bytes`, so existing config files keep working unchanged.
+    pub inline_max_bytes: Option<usize>,
+    /// v2 per-transfer ceiling in bytes.
+    pub max_transfer_bytes: u64,
+    /// v2 TCP side-channel port.
+    pub tcp_port: u16,
+    /// How long an outbound large-text transfer stays fetchable.
+    pub transfer_ttl_secs: u64,
+    /// Overall cap for one incoming TCP fetch.
+    pub fetch_timeout_secs: u64,
     pub poll_interval_ms: u64,
     pub skip_sensitive: bool,
     pub backend: BackendOverride,
@@ -39,6 +56,11 @@ impl Default for Config {
         Self {
             port: DEFAULT_PORT,
             max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
+            inline_max_bytes: None,
+            max_transfer_bytes: DEFAULT_MAX_TRANSFER_BYTES,
+            tcp_port: DEFAULT_TCP_PORT,
+            transfer_ttl_secs: DEFAULT_TRANSFER_TTL_SECS,
+            fetch_timeout_secs: DEFAULT_FETCH_TIMEOUT_SECS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             skip_sensitive: true,
             backend: BackendOverride::Auto,
@@ -80,6 +102,12 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// Effective inline ceiling: explicit `inline_max_bytes` wins, otherwise
+    /// the legacy `max_text_bytes` applies.
+    pub fn effective_inline_max_bytes(&self) -> usize {
+        self.inline_max_bytes.unwrap_or(self.max_text_bytes)
+    }
+
     /// Load the config file; a missing file means defaults.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
@@ -112,12 +140,19 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn default_values_match_spec() {
         let c = Config::default();
         assert_eq!(c.port, 47474);
         assert_eq!(c.max_text_bytes, 1200);
+        assert_eq!(c.effective_inline_max_bytes(), 1200);
+        assert_eq!(c.inline_max_bytes, None);
+        assert_eq!(c.max_transfer_bytes, 64 * 1024 * 1024);
+        assert_eq!(c.tcp_port, 47475);
+        assert_eq!(c.transfer_ttl_secs, 120);
+        assert_eq!(c.fetch_timeout_secs, 120);
         assert_eq!(c.poll_interval_ms, 300);
         assert!(c.skip_sensitive);
         assert_eq!(c.backend, BackendOverride::Auto);
@@ -125,6 +160,38 @@ mod tests {
         assert!(c.interface_deny.contains(&"lo".to_string()));
         assert!(c.interface_deny.contains(&"docker*".to_string()));
         assert!(c.interface_deny.contains(&"veth*".to_string()));
+        // Engine defaults agree with the config defaults.
+        assert_eq!(
+            c.effective_inline_max_bytes(),
+            crate::engine::DEFAULT_INLINE_MAX_BYTES
+        );
+        assert_eq!(
+            c.max_transfer_bytes,
+            crate::engine::DEFAULT_MAX_TRANSFER_BYTES
+        );
+        assert_eq!(c.tcp_port, crate::engine::DEFAULT_TCP_PORT);
+        assert_eq!(
+            Duration::from_secs(c.transfer_ttl_secs),
+            crate::engine::DEFAULT_TRANSFER_TTL
+        );
+        assert_eq!(
+            Duration::from_secs(c.fetch_timeout_secs),
+            crate::engine::DEFAULT_FETCH_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn inline_max_bytes_overrides_legacy() {
+        let cfg: Config = toml::from_str("max_text_bytes = 800\n").unwrap();
+        assert_eq!(cfg.effective_inline_max_bytes(), 800);
+        let cfg: Config =
+            toml::from_str("max_text_bytes = 800\ninline_max_bytes = 1000\n").unwrap();
+        assert_eq!(cfg.effective_inline_max_bytes(), 1000);
+        let cfg: Config = toml::from_str("tcp_port = 47476\nmax_transfer_bytes = 1048576\ntransfer_ttl_secs = 60\nfetch_timeout_secs = 30\n").unwrap();
+        assert_eq!(cfg.tcp_port, 47476);
+        assert_eq!(cfg.max_transfer_bytes, 1048576);
+        assert_eq!(cfg.transfer_ttl_secs, 60);
+        assert_eq!(cfg.fetch_timeout_secs, 30);
     }
 
     #[test]

@@ -3,6 +3,10 @@
 //! Module layout:
 //! - [`proto`]: wire format encode/decode (pure functions, no I/O)
 //! - [`crypto`]: AES-256-GCM seal/open and key handling
+//! - [`tcp`]: v2 TCP session protocol (header, HKDF key, frames, reassembly)
+//! - [`transfer`]: pending outbound large-text store
+//! - [`tcp_server`]: TCP listener serving pending transfers
+//! - [`fetch`]: TCP fetch client
 //! - [`engine`]: sync state machine, generic over clipboard/transport traits
 //! - [`clipboard`]: session detection, compositor probe, backend planning
 //! - [`net`]: real UDP transport and interface discovery

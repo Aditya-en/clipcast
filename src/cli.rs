@@ -115,16 +115,46 @@ fn run_daemon(log_content: bool) -> Result<(), CliError> {
         cfg.interface_deny.clone(),
     )?;
 
+    let inline_max = cfg.effective_inline_max_bytes();
     let engine_cfg = EngineConfig {
         key,
         device_id,
-        max_text_bytes: cfg.max_text_bytes,
+        max_text_bytes: inline_max,
+        inline_max_bytes: inline_max,
+        max_transfer_bytes: cfg.max_transfer_bytes,
+        tcp_port: cfg.tcp_port,
+        transfer_ttl: std::time::Duration::from_secs(cfg.transfer_ttl_secs),
+        fetch_timeout: std::time::Duration::from_secs(cfg.fetch_timeout_secs),
         skip_sensitive: cfg.skip_sensitive,
         log_content,
         ..EngineConfig::default()
     };
+    let engine = Engine::new(backend, transport, engine_cfg);
+
+    // TCP side channel for large text, for the daemon's lifetime. If the
+    // port is taken (e.g. a second instance on one machine), inline sync
+    // keeps working; only serving large transfers is unavailable here.
+    match crate::tcp_server::bind_listener(cfg.tcp_port) {
+        Ok(listener) => {
+            tracing::info!(port = cfg.tcp_port, "TCP transfer listener bound");
+            crate::tcp_server::spawn_server(
+                listener,
+                key,
+                engine.transfer_store(),
+                crate::tcp_server::IDLE_TIMEOUT,
+                std::time::Duration::from_secs(cfg.fetch_timeout_secs),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "TCP listener on port {} unavailable ({e}); large-text serving disabled, inline sync continues",
+                cfg.tcp_port
+            );
+        }
+    }
+
     tracing::info!("clipcast started; press Ctrl-C to stop");
-    Engine::new(backend, transport, engine_cfg).run();
+    engine.run();
     tracing::info!("clipcast stopped");
     Ok(())
 }

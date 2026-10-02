@@ -40,6 +40,13 @@ pub fn bind_listener(tcp_port: u16) -> std::io::Result<TcpListener> {
     TcpListener::bind((Ipv4Addr::UNSPECIFIED, tcp_port))
 }
 
+/// Probe whether the TCP listener could bind (diagnostics only: the socket
+/// is closed immediately). A running daemon already holds the port, so
+/// `false` from `doctor` usually means the daemon is up.
+pub fn can_bind(tcp_port: u16) -> bool {
+    bind_listener(tcp_port).is_ok()
+}
+
 /// Run the accept loop forever on this thread. Each connection gets its own
 /// worker thread; at most [`MAX_CONNECTIONS`] run concurrently.
 pub fn serve_forever(
