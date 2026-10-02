@@ -25,9 +25,10 @@ use tracing::{debug, warn};
 
 use crate::crypto::{self, KeyBytes};
 use crate::fetch::{FetchError, FetchParams, fetch_transfer};
+use crate::image_cache::ImageCache;
 use crate::proto::{
-    self, AnnouncePayload, Body, CONTENT_ANNOUNCE, CONTENT_TEXT, DEVICE_ID_LEN, Header, INNER_TEXT,
-    MSG_CLIP_UPDATE,
+    self, AnnouncePayload, Body, CONTENT_ANNOUNCE, CONTENT_TEXT, DEVICE_ID_LEN, Header,
+    INNER_IMAGE, INNER_TEXT, MSG_CLIP_UPDATE,
 };
 use crate::tcp::sha256;
 use crate::transfer::TransferStore;
@@ -37,6 +38,12 @@ pub const DEFAULT_MAX_TEXT_BYTES: usize = 1200;
 pub const DEFAULT_INLINE_MAX_BYTES: usize = 1200;
 /// Per-transfer ceiling (64 MiB).
 pub const DEFAULT_MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
+/// Per-image ceiling (16 MiB): larger images are never announced or fetched.
+pub const DEFAULT_MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
+/// How long a sent image stays fetchable from the disk cache.
+pub const DEFAULT_IMAGE_CACHE_TTL: Duration = Duration::from_secs(600);
+/// Maximum images retained in the sender disk cache.
+pub const DEFAULT_MAX_CACHED_IMAGES: usize = 20;
 /// How long a pending transfer stays fetchable.
 pub const DEFAULT_TRANSFER_TTL: Duration = Duration::from_secs(120);
 /// Overall cap for one fetch.
@@ -49,19 +56,104 @@ pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(100);
 pub const DEFAULT_SUPPRESSION: Duration = Duration::from_secs(1);
 pub const DEFAULT_RATE_LIMIT_PER_SEC: u32 = 20;
 
+/// One clipboard item the sync engine understands. Text keeps the existing
+/// behavior; images are announced over UDP and fetched over TCP, never sent
+/// inline. Backends that cannot produce an image report `None`/unsupported
+/// instead of pretending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardContent {
+    Text(String),
+    Image(ClipboardImage),
+}
+
+/// Raw image bytes with their MIME type, as exchanged with backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardImage {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl ClipboardImage {
+    /// Short hash of the image bytes for echo suppression.
+    pub fn suppression_hash(&self) -> u64 {
+        crypto::content_hash_bytes(&self.bytes)
+    }
+}
+
+impl ClipboardContent {
+    /// Short hash of the content bytes (text UTF-8 or raw image bytes) for
+    /// echo suppression. Text and images share one suppression namespace.
+    pub fn suppression_hash(&self) -> u64 {
+        match self {
+            ClipboardContent::Text(t) => crypto::content_hash(t),
+            ClipboardContent::Image(img) => crypto::content_hash_bytes(&img.bytes),
+        }
+    }
+}
+
 /// A local clipboard change delivered by a backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardEvent {
-    pub text: String,
+    pub content: ClipboardContent,
     /// The backend flagged this content as secret (e.g. MIME type
     /// `x-kde-passwordManagerHint` with value `secret`).
     pub sensitive: bool,
+}
+
+impl ClipboardEvent {
+    pub fn text(text: String, sensitive: bool) -> Self {
+        Self {
+            content: ClipboardContent::Text(text),
+            sensitive,
+        }
+    }
+
+    pub fn image(mime_type: String, bytes: Vec<u8>) -> Self {
+        Self {
+            content: ClipboardContent::Image(ClipboardImage { mime_type, bytes }),
+            sensitive: false,
+        }
+    }
+}
+
+/// Content applied to the local clipboard from a remote peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedContent {
+    Text(String),
+    Image(ClipboardImage),
+}
+
+impl AppliedContent {
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            AppliedContent::Text(t) => Some(t),
+            AppliedContent::Image(_) => None,
+        }
+    }
 }
 
 /// Local clipboard access.
 pub trait ClipboardBackend {
     fn get_text(&self) -> std::io::Result<Option<String>>;
     fn set_text(&self, text: &str) -> std::io::Result<()>;
+    /// Read the current clipboard image, if the backend supports it and the
+    /// clipboard currently holds a supported image MIME type. Defaults to
+    /// `None` (backend cannot provide images).
+    fn get_image(&self) -> std::io::Result<Option<ClipboardImage>> {
+        Ok(None)
+    }
+    /// Publish an image so local applications can paste it. The default
+    /// reports unsupported; backends override where the platform allows it.
+    fn set_image(&self, _image: &ClipboardImage) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "image clipboard not supported by this backend",
+        ))
+    }
+    /// MIME types this backend can supply (for `doctor` diagnostics).
+    fn image_mime_types(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Subscribe to change events. May be called more than once; each caller
     /// gets its own channel.
     fn subscribe_changes(&self) -> Receiver<ClipboardEvent>;
@@ -73,6 +165,15 @@ impl ClipboardBackend for Box<dyn ClipboardBackend> {
     }
     fn set_text(&self, text: &str) -> std::io::Result<()> {
         (**self).set_text(text)
+    }
+    fn get_image(&self) -> std::io::Result<Option<ClipboardImage>> {
+        (**self).get_image()
+    }
+    fn set_image(&self, image: &ClipboardImage) -> std::io::Result<()> {
+        (**self).set_image(image)
+    }
+    fn image_mime_types(&self) -> Vec<String> {
+        (**self).image_mime_types()
     }
     fn subscribe_changes(&self) -> Receiver<ClipboardEvent> {
         (**self).subscribe_changes()
@@ -112,6 +213,13 @@ pub struct EngineConfig {
     pub inline_max_bytes: usize,
     /// v2 per-transfer ceiling; larger local text is never sent.
     pub max_transfer_bytes: u64,
+    /// Per-image ceiling; larger local images are never sent and larger
+    /// remote announces are never fetched.
+    pub max_image_bytes: u64,
+    /// How long a sent image stays fetchable from the disk cache.
+    pub image_cache_ttl: Duration,
+    /// Maximum images retained in the sender disk cache.
+    pub max_cached_images: usize,
     /// TCP side-channel port we listen on and advertise in announces.
     pub tcp_port: u16,
     /// How long a pending outbound transfer stays fetchable.
@@ -137,6 +245,9 @@ impl Default for EngineConfig {
             max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
             inline_max_bytes: DEFAULT_INLINE_MAX_BYTES,
             max_transfer_bytes: DEFAULT_MAX_TRANSFER_BYTES,
+            max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
+            image_cache_ttl: DEFAULT_IMAGE_CACHE_TTL,
+            max_cached_images: DEFAULT_MAX_CACHED_IMAGES,
             tcp_port: DEFAULT_TCP_PORT,
             transfer_ttl: DEFAULT_TRANSFER_TTL,
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
@@ -149,13 +260,21 @@ impl Default for EngineConfig {
     }
 }
 
-/// Short, content-independent description of text for logging.
-fn content_meta(text: &str) -> String {
-    format!(
-        "len={} hash={:08x}",
-        text.len(),
-        crypto::content_hash(text) >> 32
-    )
+/// Short, content-independent description of a clipboard item for logging.
+fn content_meta(content: &ClipboardContent) -> String {
+    match content {
+        ClipboardContent::Text(text) => format!(
+            "text len={} hash={:08x}",
+            text.len(),
+            crypto::content_hash(text) >> 32
+        ),
+        ClipboardContent::Image(img) => format!(
+            "image {} len={} hash={:08x}",
+            img.mime_type,
+            img.bytes.len(),
+            crypto::content_hash_bytes(&img.bytes) >> 32
+        ),
+    }
 }
 
 fn hex16(id: &[u8; 16]) -> String {
@@ -170,14 +289,21 @@ pub struct Engine<B: ClipboardBackend, T: Transport> {
     last_applied: (u64, [u8; DEVICE_ID_LEN]),
     last_applied_hash: Option<u64>,
     suppression_deadline: Option<Instant>,
-    pending: Option<String>,
+    pending: Option<ClipboardContent>,
     pending_since: Option<Instant>,
     recent_recv: VecDeque<Instant>,
     /// Plaintext of outbound large texts, shared with the TCP server thread.
     store: Arc<Mutex<TransferStore>>,
+    /// Sender-side image disk cache, shared with the TCP server thread.
+    /// `None` until the daemon wires the real cache (tests set a temp one);
+    /// without it images are neither sent nor served.
+    images: Option<Arc<Mutex<ImageCache>>>,
     /// Fetches the run loop should spawn (drained after each accepted announce).
     pending_fetch_requests: Vec<FetchRequest>,
     active_fetches: Vec<ActiveFetch>,
+    /// MIME types of in-flight image fetches, by transfer id. The MIME comes
+    /// from the authenticated announce — never from the TCP bytes.
+    pending_image_mimes: Vec<([u8; 16], String)>,
     /// Transfer ids whose in-flight fetch was cancelled by a newer message.
     cancelled_fetch_ids: Vec<[u8; 16]>,
 }
@@ -243,8 +369,10 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
             pending_since: None,
             recent_recv: VecDeque::new(),
             store,
+            images: None,
             pending_fetch_requests: Vec::new(),
             active_fetches: Vec::new(),
+            pending_image_mimes: Vec::new(),
             cancelled_fetch_ids: Vec::new(),
         }
     }
@@ -256,6 +384,16 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
     /// Shared outbound-transfer store (also served by the TCP listener).
     pub fn transfer_store(&self) -> Arc<Mutex<TransferStore>> {
         Arc::clone(&self.store)
+    }
+
+    /// Wire the sender-side image disk cache (also served by the TCP
+    /// listener). The daemon calls this at startup; tests use temp dirs.
+    pub fn set_image_cache(&mut self, images: Arc<Mutex<ImageCache>>) {
+        self.images = Some(images);
+    }
+
+    pub fn image_cache(&self) -> Option<Arc<Mutex<ImageCache>>> {
+        self.images.as_ref().map(Arc::clone)
     }
 
     /// Drain queued fetch requests (each accepted announce queues exactly
@@ -274,8 +412,15 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         self.cancelled_fetch_ids.clone()
     }
 
-    /// Build fetch parameters for a queued request (real TCP dial).
+    /// Build fetch parameters for a queued request (real TCP dial). The
+    /// per-fetch byte ceiling follows the content kind: text announces use
+    /// `max_transfer_bytes`, image announces use `max_image_bytes`.
     pub fn fetch_params(&self, req: &FetchRequest) -> FetchParams {
+        let max_bytes = if req.inner_content_type == INNER_IMAGE {
+            self.cfg.max_image_bytes
+        } else {
+            self.cfg.max_transfer_bytes
+        };
         FetchParams {
             key: self.cfg.key,
             client_device_id: self.cfg.device_id,
@@ -285,7 +430,7 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
             total_len: req.total_len,
             expected_sha256: req.expected_sha256,
             inner_content_type: req.inner_content_type,
-            max_transfer_bytes: self.cfg.max_transfer_bytes,
+            max_transfer_bytes: max_bytes,
             total_timeout: self.cfg.fetch_timeout,
         }
     }
@@ -299,25 +444,25 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         if event.sensitive && self.cfg.skip_sensitive {
             debug!(
                 "not broadcasting sensitive content {}",
-                content_meta(&event.text)
+                content_meta(&event.content)
             );
             return None;
         }
         let echo = self
             .suppression_deadline
             .is_some_and(|d| Instant::now() < d)
-            && self.last_applied_hash == Some(crypto::content_hash(&event.text));
+            && self.last_applied_hash == Some(event.content.suppression_hash());
         if echo {
             debug!(
                 "suppressed echo of applied content {}",
-                content_meta(&event.text)
+                content_meta(&event.content)
             );
             return None;
         }
         if self.cfg.debounce.is_zero() {
-            return self.send_text(event.text);
+            return self.send_content(event.content);
         }
-        self.pending = Some(event.text);
+        self.pending = Some(event.content);
         self.pending_since = Some(Instant::now());
         None
     }
@@ -330,9 +475,9 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         if since.elapsed() < self.cfg.debounce {
             return;
         }
-        if let Some(text) = self.pending.take() {
+        if let Some(content) = self.pending.take() {
             self.pending_since = None;
-            self.send_text(text);
+            self.send_content(content);
         }
     }
 
@@ -341,6 +486,17 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         match self.pending_since {
             Some(since) => self.cfg.debounce.saturating_sub(since.elapsed()),
             None => Duration::from_secs(3600),
+        }
+    }
+
+    /// Send one local clipboard item immediately: small text goes inline,
+    /// large text goes as a v2 announce, images go as an image announce
+    /// backed by the disk cache. Over-limit content is logged (type and
+    /// size only, never bytes) and not sent.
+    fn send_content(&mut self, content: ClipboardContent) -> Option<Vec<u8>> {
+        match content {
+            ClipboardContent::Text(text) => self.send_text(text),
+            ClipboardContent::Image(image) => self.send_image(image),
         }
     }
 
@@ -381,7 +537,7 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         debug!(
             "broadcasting local change lamport={} {}",
             self.lamport,
-            content_meta(&text)
+            content_meta(&ClipboardContent::Text(text.clone()))
         );
         self.transport.send(&packet);
         packet
@@ -426,12 +582,89 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         packet
     }
 
-    /// Handle a received datagram. Returns the applied text for inline
+    /// Store a local image in the disk cache and broadcast one UDP image
+    /// announce for it. The image MUST be fully stored (and hashed) before
+    /// the announce goes out, so receivers can fetch it immediately.
+    fn send_image(&mut self, image: ClipboardImage) -> Option<Vec<u8>> {
+        let len = image.bytes.len() as u64;
+        if !proto::is_supported_image_mime(&image.mime_type) {
+            debug!(
+                "image not sent: unsupported MIME type {} (len={})",
+                image.mime_type,
+                image.bytes.len()
+            );
+            return None;
+        }
+        if len > self.cfg.max_image_bytes {
+            warn!(
+                "image not sent: {}, {:.1} MiB exceeds {:.0} MiB limit; MIME and size only, bytes never logged",
+                image.mime_type,
+                len as f64 / (1024.0 * 1024.0),
+                self.cfg.max_image_bytes as f64 / (1024.0 * 1024.0),
+            );
+            return None;
+        }
+        let Some(cache) = self.images.as_ref().map(Arc::clone) else {
+            warn!("image not sent: no image cache wired");
+            return None;
+        };
+        let transfer_id = crypto::generate_transfer_id();
+        let announced_sha =
+            match cache
+                .lock()
+                .unwrap()
+                .insert(transfer_id, &image.mime_type, &image.bytes)
+            {
+                Ok(sha) => sha,
+                Err(e) => {
+                    warn!("image not sent: cache store failed: {e}");
+                    return None;
+                }
+            };
+        let now_ms = unix_ms();
+        self.lamport = self.lamport.max(now_ms) + 1;
+        self.last_applied = (self.lamport, self.cfg.device_id);
+        let header = Header {
+            version: proto::VERSION,
+            msg_type: MSG_CLIP_UPDATE,
+            device_id: self.cfg.device_id,
+            nonce: crypto::generate_nonce(),
+        };
+        let payload = proto::encode_image_announce(&proto::ImageAnnouncePayload {
+            transfer_id,
+            total_len: len,
+            sha256: announced_sha,
+            tcp_port: self.cfg.tcp_port,
+            mime_type: image.mime_type.clone(),
+        });
+        let body = Body {
+            lamport: self.lamport,
+            timestamp_ms: now_ms,
+            content_type: CONTENT_ANNOUNCE,
+            payload,
+        };
+        let packet = crypto::seal(&self.cfg.key, &header, &body);
+        debug!(
+            "broadcasting image announce lamport={} transfer={} {} len={}",
+            self.lamport,
+            hex16(&transfer_id),
+            image.mime_type,
+            len
+        );
+        self.transport.send(&packet);
+        Some(packet)
+    }
+
+    /// Handle a received datagram. Returns the applied content for inline
     /// messages, if any. An accepted announce queues exactly one fetch
     /// request (see [`take_fetch_requests`](Self::take_fetch_requests)) and
     /// returns `None`; drive [`complete_fetch`](Self::complete_fetch) when
     /// the TCP fetch finishes.
-    pub fn handle_packet(&mut self, datagram: &[u8], source: Option<IpAddr>) -> Option<String> {
+    pub fn handle_packet(
+        &mut self,
+        datagram: &[u8],
+        source: Option<IpAddr>,
+    ) -> Option<AppliedContent> {
         if !self.take_recv_token() {
             debug!("dropping packet: rate limit exceeded");
             return None;
@@ -482,29 +715,67 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         debug!(
             "applied remote change lamport={} {}",
             body.lamport,
-            content_meta(&text)
+            content_meta(&ClipboardContent::Text(text.clone()))
         );
         self.last_applied = remote;
         self.lamport = self.lamport.max(body.lamport);
         self.last_applied_hash = Some(crypto::content_hash(&text));
         self.suppression_deadline = Some(Instant::now() + self.cfg.suppression);
-        Some(text)
+        Some(AppliedContent::Text(text))
     }
 
     /// Accepted-announce path: ordering + last_applied advance exactly as a
-    /// v1 message, then fetch guards, then queue one fetch.
+    /// v1 message, then fetch guards, then queue one fetch. Handles both
+    /// text announces (fixed 59-byte payload) and image announces (extended
+    /// payload with MIME type). Old clients only decode the 59-byte form.
     fn handle_announce(&mut self, header: &Header, body: &Body, source: Option<IpAddr>) {
+        enum Announce {
+            Text(AnnouncePayload),
+            Image(proto::ImageAnnouncePayload),
+        }
         let announce = match proto::decode_announce(&body.payload) {
-            Ok(a) => a,
-            Err(e) => {
-                debug!("ignoring malformed announce payload: {e}");
-                return;
-            }
+            Ok(a) => Announce::Text(a),
+            Err(_) => match proto::decode_image_announce(&body.payload) {
+                Ok(a) => Announce::Image(a),
+                Err(e) => {
+                    debug!("ignoring malformed announce payload: {e}");
+                    return;
+                }
+            },
         };
-        if announce.inner_content_type != INNER_TEXT {
+        let (inner, transfer_id, total_len, expected_sha256, tcp_port) = match &announce {
+            Announce::Text(a) => (
+                a.inner_content_type,
+                a.transfer_id,
+                a.total_len,
+                a.sha256,
+                a.tcp_port,
+            ),
+            Announce::Image(a) => (
+                INNER_IMAGE,
+                a.transfer_id,
+                a.total_len,
+                a.sha256,
+                a.tcp_port,
+            ),
+        };
+        if !matches!(inner, INNER_TEXT | INNER_IMAGE) {
+            debug!("ignoring announce with reserved inner type {inner:#04x}");
+            return;
+        }
+        // The same transfer announced twice (UDP duplicates, or a
+        // re-announce with a bumped lamport): the first accept already
+        // queued a fetch — never download twice. Checked before ordering so
+        // a re-announce neither disturbs `last_applied` nor cancels the
+        // live fetch.
+        if self
+            .active_fetches
+            .iter()
+            .any(|f| f.transfer_id == transfer_id)
+        {
             debug!(
-                "ignoring announce with reserved inner type {:#04x}",
-                announce.inner_content_type
+                "ignoring duplicate announce for in-flight transfer={}",
+                hex16(&transfer_id)
             );
             return;
         }
@@ -520,17 +791,27 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         self.last_applied = remote;
         self.lamport = self.lamport.max(body.lamport);
         self.cancel_older_fetches(remote);
+        let ceiling = if inner == INNER_IMAGE {
+            self.cfg.max_image_bytes
+        } else {
+            self.cfg.max_transfer_bytes
+        };
+        let kind = if inner == INNER_IMAGE {
+            "image"
+        } else {
+            "text"
+        };
         debug!(
-            "accepted announce lamport={} transfer={} total_len={}",
+            "accepted {kind} announce lamport={} transfer={} total_len={}",
             body.lamport,
-            hex16(&announce.transfer_id),
-            announce.total_len
+            hex16(&transfer_id),
+            total_len
         );
 
-        if announce.total_len > self.cfg.max_transfer_bytes {
+        if total_len > ceiling {
             debug!(
-                "not fetching over-limit announce: {} > max_transfer {}",
-                announce.total_len, self.cfg.max_transfer_bytes
+                "not fetching over-limit {kind} announce: {} > {}",
+                total_len, ceiling
             );
             return;
         }
@@ -538,14 +819,29 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
             debug!("not fetching announce: no source address");
             return;
         };
-        // Same content as the local clipboard: nothing to do.
-        match self.backend.get_text() {
-            Ok(Some(current)) if sha256(current.as_bytes()) == announce.sha256 => {
-                debug!("not fetching announce: clipboard already holds this content");
-                return;
-            }
-            Ok(_) => {}
-            Err(e) => debug!("clipboard read for hash check failed ({e}); fetching anyway"),
+        // Same content as the local clipboard: nothing to do. Images compare
+        // by SHA-256 of the bytes, never by URI/path.
+        let already_here = match &announce {
+            Announce::Text(_) => match self.backend.get_text() {
+                Ok(Some(current)) => sha256(current.as_bytes()) == expected_sha256,
+                Ok(None) => false,
+                Err(e) => {
+                    debug!("clipboard read for hash check failed ({e}); fetching anyway");
+                    false
+                }
+            },
+            Announce::Image(_) => match self.backend.get_image() {
+                Ok(Some(current)) => sha256(&current.bytes) == expected_sha256,
+                Ok(None) => false,
+                Err(e) => {
+                    debug!("clipboard image read for hash check failed ({e}); fetching anyway");
+                    false
+                }
+            },
+        };
+        if already_here {
+            debug!("not fetching announce: clipboard already holds this content");
+            return;
         }
         // Cap concurrent fetches: make room by cancelling the oldest.
         // (Normally unreachable — any accepted newer message already cancelled
@@ -554,29 +850,35 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
             let oldest = self.active_fetches.remove(0);
             oldest.cancel.store(true, Ordering::SeqCst);
             self.cancelled_fetch_ids.push(oldest.transfer_id);
+            self.pending_image_mimes
+                .retain(|(id, _)| *id != oldest.transfer_id);
             debug!("cancelled oldest fetch to cap concurrency");
         }
         let cancel = Arc::new(AtomicBool::new(false));
         self.pending_fetch_requests.push(FetchRequest {
-            transfer_id: announce.transfer_id,
-            total_len: announce.total_len,
-            expected_sha256: announce.sha256,
-            tcp_port: announce.tcp_port,
+            transfer_id,
+            total_len,
+            expected_sha256,
+            tcp_port,
             source: source_ip,
             lamport: body.lamport,
             device_id: header.device_id,
-            inner_content_type: announce.inner_content_type,
+            inner_content_type: inner,
             cancel: Arc::clone(&cancel),
         });
         self.active_fetches.push(ActiveFetch {
-            transfer_id: announce.transfer_id,
-            total_len: announce.total_len,
-            expected_sha256: announce.sha256,
-            inner_content_type: announce.inner_content_type,
+            transfer_id,
+            total_len,
+            expected_sha256,
+            inner_content_type: inner,
             lamport: body.lamport,
             device_id: header.device_id,
             cancel,
         });
+        if let Announce::Image(a) = &announce {
+            self.pending_image_mimes
+                .push((transfer_id, a.mime_type.clone()));
+        }
     }
 
     /// A newly accepted message cancels every in-flight older fetch.
@@ -597,6 +899,8 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
             if (fetch.lamport, fetch.device_id) < remote {
                 fetch.cancel.store(true, Ordering::SeqCst);
                 self.cancelled_fetch_ids.push(fetch.transfer_id);
+                self.pending_image_mimes
+                    .retain(|(id, _)| *id != fetch.transfer_id);
                 debug!(
                     "cancelled in-flight fetch transfer={} older than lamport={}",
                     hex16(&fetch.transfer_id),
@@ -613,11 +917,16 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
     /// the clipboard through the echo-suppression path (so the resulting
     /// change event is dropped, never rebroadcast). Any failure applies
     /// nothing and returns `None`.
+    ///
+    /// Images get one extra gate: the fetch is applied only if its
+    /// `(lamport, device_id)` is still `last_applied` — a newer text or
+    /// image accepted while the download was in flight must not be
+    /// overwritten by the stale image.
     pub fn complete_fetch(
         &mut self,
         transfer_id: [u8; 16],
         result: Result<Vec<u8>, FetchError>,
-    ) -> Option<String> {
+    ) -> Option<AppliedContent> {
         let pos = self
             .active_fetches
             .iter()
@@ -633,6 +942,15 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         // Drop the queued request twin if the worker never started.
         self.pending_fetch_requests
             .retain(|r| r.transfer_id != transfer_id);
+        // The MIME comes from the authenticated announce; snapshot it before
+        // dropping the in-flight record.
+        let image_mime = if fetch.inner_content_type == INNER_IMAGE {
+            self.image_mime_for(&fetch.transfer_id)
+        } else {
+            None
+        };
+        self.pending_image_mimes
+            .retain(|(id, _)| *id != transfer_id);
         let bytes = match result {
             Ok(b) => b,
             Err(e) => {
@@ -659,6 +977,9 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
             );
             return None;
         }
+        if fetch.inner_content_type == INNER_IMAGE {
+            return self.complete_image_fetch(&fetch, bytes, image_mime);
+        }
         let text = match String::from_utf8(bytes) {
             Ok(t) => t,
             Err(_) => {
@@ -683,11 +1004,80 @@ impl<B: ClipboardBackend, T: Transport> Engine<B, T> {
         debug!(
             "applied fetched transfer={} {}",
             hex16(&transfer_id),
-            content_meta(&text)
+            content_meta(&ClipboardContent::Text(text.clone()))
         );
         self.last_applied_hash = Some(crypto::content_hash(&text));
         self.suppression_deadline = Some(Instant::now() + self.cfg.suppression);
-        Some(text)
+        Some(AppliedContent::Text(text))
+    }
+
+    /// Image half of [`complete_fetch`](Self::complete_fetch): final
+    /// ordering check, MIME allowlist re-check, clipboard publish, and
+    /// hash-based echo suppression. Never rebroadcasts.
+    fn complete_image_fetch(
+        &mut self,
+        fetch: &ActiveFetch,
+        bytes: Vec<u8>,
+        image_mime: Option<String>,
+    ) -> Option<AppliedContent> {
+        if (fetch.lamport, fetch.device_id) != self.last_applied {
+            debug!(
+                "discarding fetched image transfer={}: a newer update won while downloading (applying nothing)",
+                hex16(&fetch.transfer_id)
+            );
+            return None;
+        }
+        let Some(mime_type) = image_mime else {
+            debug!(
+                "fetch of transfer={} has no recorded MIME type (applying nothing)",
+                hex16(&fetch.transfer_id)
+            );
+            return None;
+        };
+        if !proto::is_supported_image_mime(&mime_type) {
+            debug!(
+                "fetch of transfer={} has unsupported MIME {mime_type} (applying nothing)",
+                hex16(&fetch.transfer_id)
+            );
+            return None;
+        }
+        let image = ClipboardImage { mime_type, bytes };
+        // Publish normalization: some paste targets reject JPEG but accept
+        // PNG, so received JPEGs are transcoded before hitting the local
+        // clipboard. Everything downstream — publish AND echo suppression —
+        // must use the normalized bytes, or the watcher's change event will
+        // not match the suppression hash and will be rebroadcast.
+        let (published_mime, published_bytes) = crate::image_norm::normalize_for_clipboard(
+            &image.mime_type,
+            &image.bytes,
+            self.cfg.max_image_bytes,
+        );
+        let image = ClipboardImage {
+            mime_type: published_mime,
+            bytes: published_bytes,
+        };
+        if let Err(e) = self.backend.set_image(&image) {
+            warn!("failed to set local clipboard image: {e}");
+            return None;
+        }
+        debug!(
+            "applied fetched image transfer={} {}",
+            hex16(&fetch.transfer_id),
+            content_meta(&ClipboardContent::Image(image.clone()))
+        );
+        self.last_applied_hash = Some(image.suppression_hash());
+        self.suppression_deadline = Some(Instant::now() + self.cfg.suppression);
+        Some(AppliedContent::Image(image))
+    }
+
+    /// MIME type recorded for an in-flight image fetch. The engine learns it
+    /// from the authenticated announce; it is tracked alongside the fetch
+    /// so the TCP bytes are never trusted for typing.
+    fn image_mime_for(&self, transfer_id: &[u8; 16]) -> Option<String> {
+        self.pending_image_mimes
+            .iter()
+            .find(|(id, _)| id == transfer_id)
+            .map(|(_, mime)| mime.clone())
     }
 
     /// Refuse packets once `rate_limit_per_sec` have arrived within one second.
@@ -828,7 +1218,9 @@ mod tests {
     #[derive(Default)]
     struct ClipboardInner {
         text: Mutex<String>,
+        image: Mutex<Option<ClipboardImage>>,
         set_count: AtomicUsize,
+        image_set_count: AtomicUsize,
         subscribers: Mutex<Vec<Sender<ClipboardEvent>>>,
     }
 
@@ -845,6 +1237,12 @@ mod tests {
         fn set_count(&self) -> usize {
             self.0.set_count.load(Ordering::SeqCst)
         }
+        fn image(&self) -> Option<ClipboardImage> {
+            self.0.image.lock().unwrap().clone()
+        }
+        fn image_set_count(&self) -> usize {
+            self.0.image_set_count.load(Ordering::SeqCst)
+        }
     }
 
     impl ClipboardBackend for FakeClipboard {
@@ -856,11 +1254,29 @@ mod tests {
             self.0.set_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        fn get_image(&self) -> std::io::Result<Option<ClipboardImage>> {
+            Ok(self.image())
+        }
+        fn set_image(&self, image: &ClipboardImage) -> std::io::Result<()> {
+            *self.0.image.lock().unwrap() = Some(image.clone());
+            self.0.image_set_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn image_mime_types(&self) -> Vec<String> {
+            vec!["image/png".to_string()]
+        }
         fn subscribe_changes(&self) -> Receiver<ClipboardEvent> {
             let (tx, rx) = channel();
             self.0.subscribers.lock().unwrap().push(tx);
             rx
         }
+    }
+
+    /// Wire a temp-dir image cache into an engine under test.
+    fn wire_image_cache<B: ClipboardBackend, T: Transport>(engine: &mut Engine<B, T>) {
+        let (cache, _dir) =
+            crate::image_cache::temp_image_cache(crate::image_cache::DEFAULT_IMAGE_CACHE_TTL, 20);
+        engine.set_image_cache(cache);
     }
 
     #[derive(Default)]
@@ -925,10 +1341,7 @@ mod tests {
         let transport = FakeTransport::new();
         let mut engine = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_A));
         let packet = engine
-            .handle_local_change(ClipboardEvent {
-                text: "hello".into(),
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text("hello".into(), false))
             .expect("sent immediately (debounce zero)");
         assert_eq!(transport.sent().len(), 1);
         assert_eq!(transport.sent()[0], packet);
@@ -947,15 +1360,15 @@ mod tests {
         let mut receiver = Engine::new(clipboard.clone(), transport.clone(), cfg(DEVICE_A));
         let mut sender = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_B));
         let packet = sender
-            .handle_local_change(ClipboardEvent {
-                text: "from-b".into(),
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text("from-b".into(), false))
             .unwrap();
         assert_eq!(transport.sent().len(), 1);
 
         let applied = receiver.handle_packet(&packet, None);
-        assert_eq!(applied.as_deref(), Some("from-b"));
+        assert_eq!(
+            applied.as_ref().and_then(AppliedContent::as_text),
+            Some("from-b")
+        );
         assert_eq!(clipboard.text(), "from-b");
         // Only the originator's broadcast exists; receiving did not send.
         assert_eq!(transport.sent().len(), 1);
@@ -997,12 +1410,15 @@ mod tests {
         let mut origin = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_B));
 
         let first = origin
-            .handle_local_change(ClipboardEvent {
-                text: "one".into(),
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text("one".into(), false))
             .unwrap();
-        assert_eq!(engine.handle_packet(&first, None).as_deref(), Some("one"));
+        assert_eq!(
+            engine
+                .handle_packet(&first, None)
+                .as_ref()
+                .and_then(AppliedContent::as_text),
+            Some("one")
+        );
 
         // Duplicate of an already-applied packet.
         assert_eq!(engine.handle_packet(&first, None), None);
@@ -1026,15 +1442,18 @@ mod tests {
 
         // A newer packet from the same origin replaces it (lamport must rise).
         let second = origin
-            .handle_local_change(ClipboardEvent {
-                text: "two".into(),
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text("two".into(), false))
             .unwrap();
         let (_, second_body) = open_packet(&KEY, &second);
         let (_, first_body) = open_packet(&KEY, &first);
         assert!(second_body.lamport > first_body.lamport);
-        assert_eq!(engine.handle_packet(&second, None).as_deref(), Some("two"));
+        assert_eq!(
+            engine
+                .handle_packet(&second, None)
+                .as_ref()
+                .and_then(AppliedContent::as_text),
+            Some("two")
+        );
         assert_eq!(clipboard.text(), "two");
         // Still no rebroadcasts from the receiving engine.
         assert_eq!(transport.sent().len(), 2);
@@ -1052,17 +1471,11 @@ mod tests {
 
             // The OS already holds our local copy when the watcher fires.
             let pa = a
-                .handle_local_change(ClipboardEvent {
-                    text: "alpha".into(),
-                    sensitive: false,
-                })
+                .handle_local_change(ClipboardEvent::text("alpha".into(), false))
                 .expect("a broadcasts");
             clip_a.set_text("alpha").unwrap();
             let pb = b
-                .handle_local_change(ClipboardEvent {
-                    text: "bravo".into(),
-                    sensitive: false,
-                })
+                .handle_local_change(ClipboardEvent::text("bravo".into(), false))
                 .expect("b broadcasts");
             clip_b.set_text("bravo").unwrap();
 
@@ -1075,22 +1488,30 @@ mod tests {
             // replay them (duplicates) to prove idempotence.
             if reverse_delivery {
                 assert_eq!(
-                    b.handle_packet(&pa, None).as_deref(),
+                    b.handle_packet(&pa, None)
+                        .as_ref()
+                        .and_then(AppliedContent::as_text),
                     a_wins.then_some("alpha")
                 );
                 assert_eq!(
-                    a.handle_packet(&pb, None).as_deref(),
+                    a.handle_packet(&pb, None)
+                        .as_ref()
+                        .and_then(AppliedContent::as_text),
                     (!a_wins).then_some("bravo")
                 );
                 assert_eq!(b.handle_packet(&pa, None), None, "replay dropped");
                 assert_eq!(a.handle_packet(&pb, None), None, "replay dropped");
             } else {
                 assert_eq!(
-                    a.handle_packet(&pb, None).as_deref(),
+                    a.handle_packet(&pb, None)
+                        .as_ref()
+                        .and_then(AppliedContent::as_text),
                     (!a_wins).then_some("bravo")
                 );
                 assert_eq!(
-                    b.handle_packet(&pa, None).as_deref(),
+                    b.handle_packet(&pa, None)
+                        .as_ref()
+                        .and_then(AppliedContent::as_text),
                     a_wins.then_some("alpha")
                 );
                 assert_eq!(a.handle_packet(&pb, None), None, "replay dropped");
@@ -1120,10 +1541,7 @@ mod tests {
         let mut engine = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_A));
         let exact = "x".repeat(DEFAULT_INLINE_MAX_BYTES);
         let packet = engine
-            .handle_local_change(ClipboardEvent {
-                text: exact,
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text(exact, false))
             .expect("exactly at the limit sends inline");
         assert_eq!(transport.sent().len(), 1);
         let (_, body) = open_packet(&KEY, &packet);
@@ -1146,10 +1564,7 @@ mod tests {
         let long = "x".repeat(2001);
         assert!(
             engine
-                .handle_local_change(ClipboardEvent {
-                    text: long,
-                    sensitive: false
-                })
+                .handle_local_change(ClipboardEvent::text(long, false))
                 .is_none()
         );
         assert_eq!(transport.sent().len(), 0);
@@ -1157,10 +1572,7 @@ mod tests {
         let ok = "x".repeat(2000);
         assert!(
             engine
-                .handle_local_change(ClipboardEvent {
-                    text: ok,
-                    sensitive: false
-                })
+                .handle_local_change(ClipboardEvent::text(ok, false))
                 .is_some()
         );
         assert_eq!(transport.sent().len(), 1);
@@ -1173,10 +1585,7 @@ mod tests {
         let mut engine = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_A));
         assert!(
             engine
-                .handle_local_change(ClipboardEvent {
-                    text: "hunter2".into(),
-                    sensitive: true
-                })
+                .handle_local_change(ClipboardEvent::text("hunter2".into(), true))
                 .is_none()
         );
         assert_eq!(transport.sent().len(), 0);
@@ -1193,10 +1602,7 @@ mod tests {
         );
         assert!(
             permissive
-                .handle_local_change(ClipboardEvent {
-                    text: "hunter2".into(),
-                    sensitive: true
-                })
+                .handle_local_change(ClipboardEvent::text("hunter2".into(), true))
                 .is_some()
         );
         assert_eq!(transport.sent().len(), 1);
@@ -1210,23 +1616,20 @@ mod tests {
         let mut engine = Engine::new(clip.clone(), transport.clone(), cfg(DEVICE_A));
         let mut origin = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_B));
         let packet = origin
-            .handle_local_change(ClipboardEvent {
-                text: "remote-text".into(),
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text("remote-text".into(), false))
             .unwrap();
         let sent_before = transport.sent().len();
         assert_eq!(
-            engine.handle_packet(&packet, None).as_deref(),
+            engine
+                .handle_packet(&packet, None)
+                .as_ref()
+                .and_then(AppliedContent::as_text),
             Some("remote-text")
         );
 
         // The backend watcher now fires with the same content we just set.
         assert_eq!(
-            engine.handle_local_change(ClipboardEvent {
-                text: "remote-text".into(),
-                sensitive: false
-            }),
+            engine.handle_local_change(ClipboardEvent::text("remote-text".into(), false)),
             None
         );
         assert_eq!(transport.sent().len(), sent_before);
@@ -1234,10 +1637,7 @@ mod tests {
         // Unrelated content still broadcasts.
         assert!(
             engine
-                .handle_local_change(ClipboardEvent {
-                    text: "different".into(),
-                    sensitive: false
-                })
+                .handle_local_change(ClipboardEvent::text("different".into(), false))
                 .is_some()
         );
         assert_eq!(transport.sent().len(), sent_before + 1);
@@ -1254,10 +1654,7 @@ mod tests {
         let mut applied = 0;
         for i in 0..30 {
             let packet = origin
-                .handle_local_change(ClipboardEvent {
-                    text: format!("msg-{i}"),
-                    sensitive: false,
-                })
+                .handle_local_change(ClipboardEvent::text(format!("msg-{i}"), false))
                 .unwrap();
             if engine.handle_packet(&packet, None).is_some() {
                 applied += 1;
@@ -1279,10 +1676,7 @@ mod tests {
             },
         );
         for i in 0..5 {
-            let sent = engine.handle_local_change(ClipboardEvent {
-                text: format!("t{i}"),
-                sensitive: false,
-            });
+            let sent = engine.handle_local_change(ClipboardEvent::text(format!("t{i}"), false));
             assert!(sent.is_none(), "nothing sent while debouncing");
         }
         assert_eq!(transport.sent().len(), 0);
@@ -1308,10 +1702,7 @@ mod tests {
 
         let mut origin = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_B));
         let packet = origin
-            .handle_local_change(ClipboardEvent {
-                text: "via-loop".into(),
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text("via-loop".into(), false))
             .unwrap();
         transport.inject(packet);
 
@@ -1381,10 +1772,7 @@ mod tests {
         let mut engine = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_A));
         let big = "x".repeat(DEFAULT_INLINE_MAX_BYTES + 500);
         let packet = engine
-            .handle_local_change(ClipboardEvent {
-                text: big.clone(),
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text(big.clone(), false))
             .expect("large text announces");
         assert_eq!(transport.sent().len(), 1);
         let (_, body) = open_packet(&KEY, &packet);
@@ -1413,10 +1801,7 @@ mod tests {
         let mut sender = Engine::new(FakeClipboard::new(), send_transport, cfg(DEVICE_B));
         let big = "y".repeat(5000);
         let announce = sender
-            .handle_local_change(ClipboardEvent {
-                text: big,
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text(big, false))
             .unwrap();
 
         let recv_transport = FakeTransport::new();
@@ -1448,17 +1833,14 @@ mod tests {
         let applied = receiver
             .complete_fetch(reqs[0].transfer_id, Ok(content))
             .expect("valid fetch applies");
-        assert_eq!(applied, "fetched-large-text");
+        assert_eq!(applied.as_text(), Some("fetched-large-text"));
         assert_eq!(clipboard.text(), "fetched-large-text");
         assert_eq!(recv_transport.sent().len(), 0, "no rebroadcast");
         assert_eq!(receiver.active_fetch_count(), 0);
 
         // The clipboard change event from our own write is echo-suppressed.
         assert_eq!(
-            receiver.handle_local_change(ClipboardEvent {
-                text: "fetched-large-text".into(),
-                sensitive: false
-            }),
+            receiver.handle_local_change(ClipboardEvent::text("fetched-large-text".into(), false)),
             None
         );
         assert_eq!(recv_transport.sent().len(), 0);
@@ -1529,7 +1911,10 @@ mod tests {
 
         let inline = craft_inline([0xC0; 16], 2000, "newer inline wins");
         assert_eq!(
-            receiver.handle_packet(&inline, Some(LOOPBACK)).as_deref(),
+            receiver
+                .handle_packet(&inline, Some(LOOPBACK))
+                .as_ref()
+                .and_then(AppliedContent::as_text),
             Some("newer inline wins")
         );
         assert_eq!(receiver.cancelled_fetch_ids(), vec![[0x41; 16]]);
@@ -1642,15 +2027,13 @@ mod tests {
         sender_cfg.tcp_port = listener.local_addr().unwrap().port();
         let mut sender = Engine::new(FakeClipboard::new(), FakeTransport::new(), sender_cfg);
         let announce = sender
-            .handle_local_change(ClipboardEvent {
-                text: text.clone(),
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text(text.clone(), false))
             .expect("5 MB announces");
         crate::tcp_server::spawn_server(
             listener,
             KEY,
             sender.transfer_store(),
+            None,
             Duration::from_secs(10),
             Duration::from_secs(120),
         );
@@ -1671,7 +2054,7 @@ mod tests {
         let applied = receiver
             .complete_fetch(reqs[0].transfer_id, Ok(bytes))
             .expect("valid 5 MB fetch applies");
-        assert_eq!(applied, text);
+        assert_eq!(applied.as_text(), Some(text.as_str()));
         assert_eq!(clipboard.text(), text);
         assert_eq!(
             recv_transport.sent().len(),
@@ -1680,10 +2063,7 @@ mod tests {
         );
         // Echo of the applied content is suppressed.
         assert_eq!(
-            receiver.handle_local_change(ClipboardEvent {
-                text,
-                sensitive: false
-            }),
+            receiver.handle_local_change(ClipboardEvent::text(text, false)),
             None
         );
     }
@@ -1693,10 +2073,7 @@ mod tests {
     fn wrong_key_announce_never_fetches() {
         let mut sender = Engine::new(FakeClipboard::new(), FakeTransport::new(), cfg(DEVICE_B));
         let announce = sender
-            .handle_local_change(ClipboardEvent {
-                text: "z".repeat(5000),
-                sensitive: false,
-            })
+            .handle_local_change(ClipboardEvent::text("z".repeat(5000), false))
             .unwrap();
         let mut receiver = Engine::new(
             FakeClipboard::new(),
@@ -1705,5 +2082,365 @@ mod tests {
         );
         assert_eq!(receiver.handle_packet(&announce, Some(LOOPBACK)), None);
         assert!(receiver.take_fetch_requests().is_empty());
+    }
+
+    // ---------- image sync ----------
+
+    fn sample_image() -> ClipboardImage {
+        ClipboardImage {
+            mime_type: "image/png".to_string(),
+            // Deterministic 1x1 PNG bytes (not a real photo).
+            bytes: vec![
+                0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+                b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, b'I', b'D', b'A', b'T', 0x08,
+                0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe,
+                0xd4, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+            ],
+        }
+    }
+
+    fn craft_image_announce(
+        device: [u8; 16],
+        lamport: u64,
+        transfer_id: [u8; 16],
+        image: &ClipboardImage,
+        tcp_port: u16,
+    ) -> Vec<u8> {
+        let header = Header {
+            version: proto::VERSION,
+            msg_type: MSG_CLIP_UPDATE,
+            device_id: device,
+            nonce: crypto::generate_nonce(),
+        };
+        let payload = proto::encode_image_announce(&proto::ImageAnnouncePayload {
+            transfer_id,
+            total_len: image.bytes.len() as u64,
+            sha256: sha256(&image.bytes),
+            tcp_port,
+            mime_type: image.mime_type.clone(),
+        });
+        let body = Body {
+            lamport,
+            timestamp_ms: 0,
+            content_type: CONTENT_ANNOUNCE,
+            payload,
+        };
+        crypto::seal(&KEY, &header, &body)
+    }
+
+    /// Local image produces exactly one image announce; the bytes are
+    /// already in the sender cache (fetchable) before the announce exists.
+    #[test]
+    fn local_image_produces_exactly_one_announce() {
+        let transport = FakeTransport::new();
+        let mut engine = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_A));
+        wire_image_cache(&mut engine);
+        let image = sample_image();
+        let packet = engine
+            .handle_local_change(ClipboardEvent::image(
+                image.mime_type.clone(),
+                image.bytes.clone(),
+            ))
+            .expect("image announces");
+        assert_eq!(transport.sent().len(), 1);
+        let (_, body) = open_packet(&KEY, &packet);
+        assert_eq!(body.content_type, CONTENT_ANNOUNCE);
+        let announce = proto::decode_image_announce(&body.payload).unwrap();
+        assert_eq!(announce.mime_type, "image/png");
+        assert_eq!(announce.total_len, image.bytes.len() as u64);
+        assert_eq!(announce.sha256, sha256(&image.bytes));
+        // Fetchable immediately: the cache holds the exact bytes.
+        let cache = engine.image_cache().unwrap();
+        let (bytes, mime, sha) = cache.lock().unwrap().serve(&announce.transfer_id).unwrap();
+        assert_eq!(bytes, image.bytes);
+        assert_eq!(mime, "image/png");
+        assert_eq!(sha, announce.sha256);
+    }
+
+    /// Oversized local images are never announced (MIME + size logged only).
+    #[test]
+    fn oversized_local_image_not_announced() {
+        let transport = FakeTransport::new();
+        let mut engine = Engine::new(
+            FakeClipboard::new(),
+            transport.clone(),
+            EngineConfig {
+                max_image_bytes: 10,
+                debounce: Duration::ZERO,
+                ..EngineConfig::new(KEY, DEVICE_A)
+            },
+        );
+        wire_image_cache(&mut engine);
+        let image = sample_image();
+        assert!(image.bytes.len() as u64 > 10);
+        assert_eq!(
+            engine.handle_local_change(ClipboardEvent::image(image.mime_type, image.bytes)),
+            None
+        );
+        assert_eq!(transport.sent().len(), 0);
+    }
+
+    /// Unsupported MIME types are never announced.
+    #[test]
+    fn unsupported_mime_not_announced() {
+        let transport = FakeTransport::new();
+        let mut engine = Engine::new(FakeClipboard::new(), transport.clone(), cfg(DEVICE_A));
+        wire_image_cache(&mut engine);
+        assert_eq!(
+            engine.handle_local_change(ClipboardEvent::image(
+                "image/gif".to_string(),
+                vec![0x47, 0x49, 0x46],
+            )),
+            None
+        );
+        assert_eq!(transport.sent().len(), 0);
+    }
+
+    /// Full loopback: sender announces, receiver fetches over real TCP
+    /// (served from the sender's disk cache), verifies, and applies the
+    /// image exactly once without rebroadcasting.
+    #[test]
+    fn image_loopback_applies_once_without_rebroadcast() {
+        use std::net::TcpListener;
+        let image = sample_image();
+        let mut sender_cfg = cfg(DEVICE_B);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender_cfg.tcp_port = listener.local_addr().unwrap().port();
+        let mut sender = Engine::new(FakeClipboard::new(), FakeTransport::new(), sender_cfg);
+        wire_image_cache(&mut sender);
+        let sender_images = sender.image_cache().unwrap();
+        let announce = sender
+            .handle_local_change(ClipboardEvent::image(
+                image.mime_type.clone(),
+                image.bytes.clone(),
+            ))
+            .expect("image announces");
+        crate::tcp_server::spawn_server(
+            listener,
+            KEY,
+            sender.transfer_store(),
+            Some(sender_images),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+
+        let recv_transport = FakeTransport::new();
+        let clipboard = FakeClipboard::new();
+        let mut receiver = Engine::new(clipboard.clone(), recv_transport.clone(), cfg(DEVICE_A));
+        assert_eq!(receiver.handle_packet(&announce, Some(LOOPBACK)), None);
+        let reqs = receiver.take_fetch_requests();
+        assert_eq!(reqs.len(), 1, "exactly one image fetch queued");
+
+        let params = receiver.fetch_params(&reqs[0]);
+        assert_eq!(params.max_transfer_bytes, DEFAULT_MAX_IMAGE_BYTES);
+        let cancel = AtomicBool::new(false);
+        let bytes = crate::fetch::fetch_transfer(&params, &cancel).expect("image fetch");
+        let applied = receiver
+            .complete_fetch(reqs[0].transfer_id, Ok(bytes))
+            .expect("valid image applies");
+        assert_eq!(applied, AppliedContent::Image(image.clone()));
+        assert_eq!(clipboard.image(), Some(image.clone()));
+        assert_eq!(clipboard.image_set_count(), 1);
+        assert_eq!(
+            recv_transport.sent().len(),
+            0,
+            "received image not rebroadcast"
+        );
+
+        // The clipboard change event from our own write is echo-suppressed.
+        assert_eq!(
+            receiver.handle_local_change(ClipboardEvent::image(
+                image.mime_type.clone(),
+                image.bytes.clone()
+            )),
+            None
+        );
+        assert_eq!(recv_transport.sent().len(), 0);
+    }
+
+    /// Duplicate announces for an in-flight transfer queue no second fetch.
+    #[test]
+    fn duplicate_image_announce_no_second_fetch() {
+        let image = sample_image();
+        let mut receiver = Engine::new(FakeClipboard::new(), FakeTransport::new(), cfg(DEVICE_A));
+        let first = craft_image_announce(DEVICE_B, 1000, [0x71; 16], &image, DEFAULT_TCP_PORT);
+        assert_eq!(receiver.handle_packet(&first, Some(LOOPBACK)), None);
+        assert_eq!(receiver.take_fetch_requests().len(), 1);
+        // Exact duplicate (same lamport): dropped by ordering.
+        assert_eq!(receiver.handle_packet(&first, Some(LOOPBACK)), None);
+        assert!(receiver.take_fetch_requests().is_empty());
+        // Same transfer re-announced with a newer lamport: accepted for
+        // ordering but no second download of the in-flight transfer.
+        let reannounce = craft_image_announce(DEVICE_B, 1001, [0x71; 16], &image, DEFAULT_TCP_PORT);
+        assert_eq!(receiver.handle_packet(&reannounce, Some(LOOPBACK)), None);
+        assert!(receiver.take_fetch_requests().is_empty());
+        assert_eq!(receiver.active_fetch_count(), 1);
+    }
+
+    /// An older image arriving after a newer one is ignored.
+    #[test]
+    fn older_image_ignored() {
+        let image = sample_image();
+        let mut receiver = Engine::new(FakeClipboard::new(), FakeTransport::new(), cfg(DEVICE_A));
+        let new = craft_image_announce(DEVICE_B, 2000, [0x72; 16], &image, DEFAULT_TCP_PORT);
+        let old = craft_image_announce(DEVICE_B, 1000, [0x73; 16], &image, DEFAULT_TCP_PORT);
+        assert_eq!(receiver.handle_packet(&new, Some(LOOPBACK)), None);
+        assert_eq!(receiver.take_fetch_requests().len(), 1);
+        assert_eq!(receiver.handle_packet(&old, Some(LOOPBACK)), None);
+        assert!(receiver.take_fetch_requests().is_empty());
+    }
+
+    /// Own-device image announces are ignored.
+    #[test]
+    fn own_device_image_announce_ignored() {
+        let image = sample_image();
+        let mut engine = Engine::new(FakeClipboard::new(), FakeTransport::new(), cfg(DEVICE_A));
+        let packet = craft_image_announce(DEVICE_A, u64::MAX, [0x74; 16], &image, DEFAULT_TCP_PORT);
+        assert_eq!(engine.handle_packet(&packet, Some(LOOPBACK)), None);
+        assert!(engine.take_fetch_requests().is_empty());
+    }
+
+    /// §11 race: a newer text accepted while an image downloads wins — the
+    /// stale image is discarded and the clipboard keeps the text.
+    #[test]
+    fn newer_text_during_image_download_wins() {
+        let image = sample_image();
+        let clipboard = FakeClipboard::new();
+        let mut receiver = Engine::new(clipboard.clone(), FakeTransport::new(), cfg(DEVICE_A));
+        let announce = craft_image_announce(DEVICE_B, 1000, [0x75; 16], &image, DEFAULT_TCP_PORT);
+        assert_eq!(receiver.handle_packet(&announce, Some(LOOPBACK)), None);
+        let reqs = receiver.take_fetch_requests();
+        assert_eq!(reqs.len(), 1);
+
+        // Newer inline text from another device arrives mid-download.
+        let text_packet = craft_inline(DEVICE_B, 1001, "newer text");
+        assert_eq!(
+            receiver
+                .handle_packet(&text_packet, Some(LOOPBACK))
+                .as_ref()
+                .and_then(AppliedContent::as_text),
+            Some("newer text")
+        );
+        // The late image result is discarded: ordering moved on.
+        assert_eq!(
+            receiver.complete_fetch(reqs[0].transfer_id, Ok(image.bytes.clone())),
+            None
+        );
+        assert_eq!(clipboard.image_set_count(), 0, "stale image never applied");
+        assert_eq!(clipboard.text(), "newer text");
+    }
+
+    /// A received JPEG is normalized to PNG before hitting the clipboard
+    /// (some paste targets reject JPEG), and echo suppression follows the
+    /// PUBLISHED bytes so the watcher's PNG event does not rebroadcast.
+    #[test]
+    fn received_jpeg_published_as_png_with_matching_suppression() {
+        let jpeg: Vec<u8> = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/red-8x8.jpg"
+        ))
+        .expect("test JPEG must exist");
+        let image = ClipboardImage {
+            mime_type: "image/jpeg".to_string(),
+            bytes: jpeg.clone(),
+        };
+        let clipboard = FakeClipboard::new();
+        let mut receiver = Engine::new(clipboard.clone(), FakeTransport::new(), cfg(DEVICE_A));
+        let announce = craft_image_announce(DEVICE_B, 1000, [0x7C; 16], &image, DEFAULT_TCP_PORT);
+        assert_eq!(receiver.handle_packet(&announce, Some(LOOPBACK)), None);
+        let reqs = receiver.take_fetch_requests();
+        assert_eq!(reqs.len(), 1);
+        let applied = receiver
+            .complete_fetch(reqs[0].transfer_id, Ok(jpeg))
+            .expect("valid image applies");
+        let AppliedContent::Image(published) = applied else {
+            panic!("expected image content");
+        };
+        assert_eq!(published.mime_type, "image/png");
+        assert_eq!(&published.bytes[0..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(clipboard.image(), Some(published.clone()));
+        // The watcher's PNG change event is echo-suppressed (hash follows
+        // the published bytes, not the wire bytes).
+        assert_eq!(
+            receiver
+                .handle_local_change(ClipboardEvent::image(published.mime_type, published.bytes)),
+            None
+        );
+    }
+
+    /// Corrupt image bytes (hash mismatch) apply nothing.
+    #[test]
+    fn corrupt_image_fetch_applies_nothing() {
+        let image = sample_image();
+        let clipboard = FakeClipboard::new();
+        let mut receiver = Engine::new(clipboard.clone(), FakeTransport::new(), cfg(DEVICE_A));
+        let announce = craft_image_announce(DEVICE_B, 1000, [0x76; 16], &image, DEFAULT_TCP_PORT);
+        assert_eq!(receiver.handle_packet(&announce, Some(LOOPBACK)), None);
+        let reqs = receiver.take_fetch_requests();
+        assert_eq!(reqs.len(), 1);
+        let mut tampered = image.bytes.clone();
+        tampered[10] ^= 0xFF;
+        assert_eq!(
+            receiver.complete_fetch(reqs[0].transfer_id, Ok(tampered)),
+            None
+        );
+        assert_eq!(clipboard.image_set_count(), 0);
+    }
+
+    /// Over-limit image announces are never fetched.
+    #[test]
+    fn over_limit_image_announce_not_fetched() {
+        let image = sample_image();
+        let mut receiver = Engine::new(
+            FakeClipboard::new(),
+            FakeTransport::new(),
+            EngineConfig {
+                max_image_bytes: 10,
+                debounce: Duration::ZERO,
+                ..EngineConfig::new(KEY, DEVICE_A)
+            },
+        );
+        let announce = craft_image_announce(DEVICE_B, 1000, [0x77; 16], &image, DEFAULT_TCP_PORT);
+        assert_eq!(receiver.handle_packet(&announce, Some(LOOPBACK)), None);
+        assert!(receiver.take_fetch_requests().is_empty());
+    }
+
+    /// A newer accepted announce cancels older in-flight fetches: only the
+    /// newest transfer stays live, so one peer can never hold more than one
+    /// fetch slot per ordering round (plus the hard
+    /// [`MAX_CONCURRENT_FETCHES`] cap as backstop).
+    #[test]
+    fn newer_announce_cancels_older_image_fetch() {
+        let image = sample_image();
+        let mut receiver = Engine::new(FakeClipboard::new(), FakeTransport::new(), cfg(DEVICE_A));
+        for (i, id) in [[0x78; 16], [0x79; 16], [0x7A; 16]].into_iter().enumerate() {
+            let announce =
+                craft_image_announce(DEVICE_B, 1000 + i as u64, id, &image, DEFAULT_TCP_PORT);
+            assert_eq!(receiver.handle_packet(&announce, Some(LOOPBACK)), None);
+        }
+        assert_eq!(receiver.active_fetch_count(), 1);
+        // Both the queued-request twin and the in-flight twin of each older
+        // fetch are recorded cancelled.
+        let mut cancelled = receiver.cancelled_fetch_ids();
+        cancelled.sort();
+        cancelled.dedup();
+        assert_eq!(cancelled, vec![[0x78; 16], [0x79; 16]]);
+    }
+
+    /// Tampering with any byte of an image announce fails authentication.
+    #[test]
+    fn tampered_image_announce_fails_auth() {
+        let image = sample_image();
+        let packet = craft_image_announce(DEVICE_B, 1000, [0x7B; 16], &image, DEFAULT_TCP_PORT);
+        for i in [0, 4, 5, 22, 34, 40, packet.len() - 1] {
+            let mut bad = packet.clone();
+            bad[i] ^= 0x01;
+            assert!(
+                crypto::open(&KEY, &bad).is_err(),
+                "byte {i} tamper must fail auth"
+            );
+        }
     }
 }

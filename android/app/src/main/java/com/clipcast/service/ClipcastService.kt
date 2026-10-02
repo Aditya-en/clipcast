@@ -18,11 +18,13 @@ import com.clipcast.R
 import com.clipcast.protocol.Crypto
 import com.clipcast.protocol.LargeTextLimits
 import com.clipcast.protocol.SyncState
+import com.clipcast.protocol.TcpCrypto
 import com.clipcast.ui.MainActivity
 import com.clipcast.ui.SendActivity
 import com.clipcast.ui.ServiceStateHolder
 import com.clipcast.util.ClipboardHelper
 import com.clipcast.util.Preferences
+import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -40,6 +42,10 @@ class ClipcastService : Service() {
         const val ACTION_QUERY_STATUS = "com.clipcast.ACTION_QUERY_STATUS"
         const val EXTRA_TEXT = "extra_text"
         const val EXTRA_QUIET = "extra_quiet"
+        /** Absolute path of a staged image file under our cache dir. */
+        const val EXTRA_IMAGE_PATH = "extra_image_path"
+        /** MIME type of the staged image (allowlisted). */
+        const val EXTRA_IMAGE_MIME = "extra_image_mime"
 
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "clipcast_sync"
@@ -76,13 +82,18 @@ class ClipcastService : Service() {
 
     // Large-text side channel (v2).
     private var transferStore: TransferStore? = null
+    private var imageCache: ImageCache? = null
     private var tcpServer: TcpServer? = null
     private var fetchExecutor = Executors.newFixedThreadPool(LargeTextLimits.MAX_CONCURRENT_FETCHES)
     private val fetchLock = Any()
     private var fetchGeneration = 0
     private val activeFetches = mutableMapOf<Int, FetchHandle>()
+    /** Transfer ids with a live image fetch: re-announces never start a second download. */
+    private val activeImageTransfers = mutableSetOf<String>()
     private var tcpStatus: String = "TCP stopped"
     private var lastTransfer: String = "none"
+    private var lastRxIsImage: Boolean = false
+    private var lastTxIsImage: Boolean = false
 
     private class FetchHandle {
         val cancel = AtomicBoolean(false)
@@ -112,9 +123,13 @@ class ClipcastService : Service() {
             ACTION_STOP -> stopServiceLogic()
             ACTION_QUERY_STATUS -> publishState()
             ACTION_SEND_CLIPBOARD -> {
+                val imagePath = intent.getStringExtra(EXTRA_IMAGE_PATH)
+                val imageMime = intent.getStringExtra(EXTRA_IMAGE_MIME)
                 val text = intent.getStringExtra(EXTRA_TEXT)
                 val quiet = intent.getBooleanExtra(EXTRA_QUIET, false)
-                if (text != null) {
+                if (imagePath != null && imageMime != null) {
+                    sendImageFile(imagePath, imageMime, quiet)
+                } else if (text != null) {
                     sendText(text, quiet)
                 }
             }
@@ -155,11 +170,23 @@ class ClipcastService : Service() {
         // Large-text side channel: serve our pending transfers over TCP.
         // The listener only works while this service is alive (see README).
         val store = TransferStore().also { transferStore = it }
+        val images = ImageCache(File(cacheDir, "send_images")).also { imageCache = it }
+        // Drop orphaned staging files (e.g. the process died mid-send).
+        try {
+            File(cacheDir, "send_staging").listFiles()?.forEach { file ->
+                if (System.currentTimeMillis() - file.lastModified() > 3_600_000) {
+                    file.delete()
+                }
+            }
+        } catch (e: Exception) {
+            Log.d("ClipcastService", "staging cleanup failed", e)
+        }
         val tcpPort = preferences?.tcpPort ?: LargeTextLimits.DEFAULT_TCP_PORT
         val server = TcpServer(
             tcpPort,
             keyProvider = { preferences?.getKeyBytes() },
             store = store,
+            imageCache = images,
             listener = object : TcpServer.Listener {
                 override fun onListening(port: Int) {
                     tcpStatus = "TCP listening on port $port"
@@ -204,6 +231,7 @@ class ClipcastService : Service() {
         tcpServer?.stop()
         tcpServer = null
         transferStore = null
+        imageCache = null
         tcpStatus = "TCP stopped"
 
         multicastLock?.release()
@@ -264,10 +292,16 @@ class ClipcastService : Service() {
             processV1Message(decoded)
             return
         }
-        // Large-text announce (content_type 0x80).
-        val announce = Crypto.decodeAnnounce(keyBytes, data) ?: return
+        // Large-text announce (content_type 0x80, 59-byte payload).
+        val announce = Crypto.decodeAnnounce(keyBytes, data)
+        if (announce != null) {
+            if (source != null) processAnnounce(announce, source)
+            return
+        }
+        // Image announce (content_type 0x80, 60..123-byte payload).
+        val imageAnnounce = Crypto.decodeImageAnnounce(keyBytes, data) ?: return
         if (source != null) {
-            processAnnounce(announce, source)
+            processImageAnnounce(imageAnnounce, source)
         }
     }
 
@@ -373,7 +407,110 @@ class ClipcastService : Service() {
             AnnouncePolicy.Decision.FETCH -> Unit
         }
 
-        // A newer accepted message cancels an older fetch.
+        enqueueFetch(
+            FetchJob(
+                transferId = announce.transferId.copyOf(),
+                totalLen = announce.totalLen,
+                sha256 = announce.sha256.copyOf(),
+                tcpPort = announce.tcpPort,
+                innerContentType = announce.innerContentType,
+                mimeType = null,
+                maxBytes = maxApply,
+                source = source,
+                isImage = false
+            )
+        )
+    }
+
+    /**
+     * Image announce path (content_type 0x80, inner 0x02). Same ordering
+     * machinery as text; the fetched bytes are verified (length, SHA-256)
+     * and published to the clipboard as a content URI under the announced
+     * MIME type. Nothing is applied before verification.
+     */
+    private fun processImageAnnounce(announce: Crypto.DecodedImageAnnounce, source: InetAddress) {
+        val now = System.currentTimeMillis()
+        if (!checkRateLimit(now)) {
+            return
+        }
+
+        val ourDeviceId = preferences?.deviceId ?: return
+        if (announce.deviceId.contentEquals(ourDeviceId)) {
+            return
+        }
+
+        // Same transfer already downloading: never start a second download.
+        // Checked before ordering so a re-announce disturbs nothing.
+        val transferHex = Crypto.bytesToHex(announce.transferId)
+        synchronized(fetchLock) {
+            if (activeImageTransfers.contains(transferHex)) {
+                Log.d("ClipcastService", "ignoring duplicate announce for in-flight image transfer")
+                return
+            }
+        }
+
+        val shouldApply = syncState?.onReceive(announce.lamport, announce.deviceId) ?: false
+        if (!shouldApply) {
+            return
+        }
+        // Accepted: last_applied already advanced by onReceive.
+
+        val announceHashHex = Crypto.bytesToHex(announce.sha256)
+        when (AnnouncePolicy.decideImage(
+            announce.totalLen, LargeTextLimits.MAX_IMAGE_BYTES, announce.mimeType,
+            announceHashHex, lastAppliedContentHash
+        )) {
+            AnnouncePolicy.Decision.SKIP_OVER_LIMIT -> {
+                Log.d("ClipcastService", "image announce ${announce.totalLen} exceeds max ${LargeTextLimits.MAX_IMAGE_BYTES}; skipping")
+                lastTransfer =
+                    "Image exceeds the 16 MB sync limit (${announce.totalLen} bytes)"
+                publishState()
+                return
+            }
+            AnnouncePolicy.Decision.SKIP_UNKNOWN_TYPE -> {
+                Log.d("ClipcastService", "ignoring image announce with unsupported MIME ${announce.mimeType}")
+                return
+            }
+            AnnouncePolicy.Decision.SKIP_DUPLICATE -> {
+                Log.d("ClipcastService", "ignoring image announce matching already-applied content")
+                return
+            }
+            AnnouncePolicy.Decision.FETCH -> Unit
+        }
+
+        synchronized(fetchLock) { activeImageTransfers.add(transferHex) }
+        enqueueFetch(
+            FetchJob(
+                transferId = announce.transferId.copyOf(),
+                totalLen = announce.totalLen,
+                sha256 = announce.sha256.copyOf(),
+                tcpPort = announce.tcpPort,
+                innerContentType = Crypto.INNER_IMAGE,
+                mimeType = announce.mimeType,
+                maxBytes = LargeTextLimits.MAX_IMAGE_BYTES,
+                source = source,
+                isImage = true
+            )
+        )
+    }
+
+    /** One accepted announce awaiting (or undergoing) a TCP fetch. */
+    private data class FetchJob(
+        val transferId: ByteArray,
+        val totalLen: Long,
+        val sha256: ByteArray,
+        val tcpPort: Int,
+        val innerContentType: Byte,
+        /** Announced MIME type for images (from the authenticated announce, never the TCP bytes). */
+        val mimeType: String?,
+        val maxBytes: Long,
+        /** The announce datagram's source address — the only address ever dialed. */
+        val source: InetAddress,
+        val isImage: Boolean
+    )
+
+    /** A newer accepted message cancels an older fetch. */
+    private fun enqueueFetch(job: FetchJob) {
         val handle = FetchHandle()
         val generation = synchronized(fetchLock) {
             cancelActiveFetchesLocked()
@@ -383,38 +520,41 @@ class ClipcastService : Service() {
         }
         try {
             fetchExecutor.execute {
-                runFetch(generation, handle, announce, source, maxApply)
+                runFetch(generation, handle, job)
             }
         } catch (e: Exception) {
             synchronized(fetchLock) { activeFetches.remove(generation) }
+            if (job.isImage) removeImageTransfer(job.transferId)
             Log.w("ClipcastService", "fetch submit failed", e)
         }
+    }
+
+    private fun removeImageTransfer(transferId: ByteArray) {
+        synchronized(fetchLock) { activeImageTransfers.remove(Crypto.bytesToHex(transferId)) }
     }
 
     private fun runFetch(
         generation: Int,
         handle: FetchHandle,
-        announce: Crypto.DecodedAnnounce,
-        source: InetAddress,
-        maxApply: Long
+        job: FetchJob
     ) {
         try {
             val keyBytes = preferences?.getKeyBytes()
             val deviceId = preferences?.deviceId
             if (keyBytes == null || deviceId == null) {
-                finishFetch(generation, "Transfer failed (no key)")
+                finishFetch(generation, "Transfer failed (no key)", job)
                 return
             }
             val params = TcpFetchClient.Params(
                 key = keyBytes,
                 clientDeviceId = deviceId,
-                serverAddress = source,
-                tcpPort = announce.tcpPort,
-                transferId = announce.transferId.copyOf(),
-                totalLen = announce.totalLen,
-                expectedSha256 = announce.sha256.copyOf(),
-                innerContentType = announce.innerContentType,
-                maxTransferBytes = maxApply,
+                serverAddress = job.source,
+                tcpPort = job.tcpPort,
+                transferId = job.transferId.copyOf(),
+                totalLen = job.totalLen,
+                expectedSha256 = job.sha256.copyOf(),
+                innerContentType = job.innerContentType,
+                maxTransferBytes = job.maxBytes,
                 totalTimeoutMs = LargeTextLimits.TOTAL_TIMEOUT_MS
             )
             val data = TcpFetchClient.fetch(params, handle.cancel, handle.socketRef)
@@ -422,44 +562,96 @@ class ClipcastService : Service() {
             synchronized(fetchLock) {
                 if (generation != fetchGeneration) {
                     Log.d("ClipcastService", "fetch superseded by newer message; discarding")
+                    if (job.isImage) removeImageTransfer(job.transferId)
                     return
                 }
             }
-            // Length, SHA-256, and strict UTF-8 already verified by the fetch.
-            // Only now touch the clipboard, on the main thread.
-            val text = String(data, java.nio.charset.StandardCharsets.UTF_8)
-            val now = System.currentTimeMillis()
-            lastAppliedContentHash = ClipboardHelper.contentHash(text)
-            lastAppliedTime = now
-            Looper.getMainLooper().let { mainLooper ->
-                android.os.Handler(mainLooper).post {
-                    try {
-                        ClipboardHelper.setText(this@ClipcastService, text)
-                    } catch (t: Throwable) {
-                        Log.w("ClipcastService", "setPrimaryClip failed", t)
-                    }
-                }
+            if (job.isImage) {
+                applyFetchedImage(job, data)
+            } else {
+                applyFetchedText(data)
             }
-            lastRxTime = System.currentTimeMillis()
-            lastRxLen = data.size
-            finishFetch(generation, "Received ${data.size} bytes")
+            finishFetch(generation, null, job)
         } catch (e: TcpFetchClient.FetchException) {
             if (e.kind == TcpFetchClient.FetchException.Kind.CANCELLED) {
                 Log.d("ClipcastService", "fetch cancelled (newer message accepted)")
                 synchronized(fetchLock) { activeFetches.remove(generation) }
+                if (job.isImage) removeImageTransfer(job.transferId)
             } else {
                 Log.w("ClipcastService", "fetch failed: ${e.message}")
-                finishFetch(generation, "Transfer failed (${e.kind.name.lowercase()})")
+                finishFetch(generation, "Transfer failed (${e.kind.name.lowercase()})", job)
             }
         } catch (e: Exception) {
             Log.w("ClipcastService", "fetch failed", e)
-            finishFetch(generation, "Transfer failed (error)")
+            finishFetch(generation, "Transfer failed (error)", job)
         }
     }
 
-    private fun finishFetch(generation: Int, transferStatus: String) {
+    /** Text half: length, SHA-256, and strict UTF-8 already verified by the fetch. */
+    private fun applyFetchedText(data: ByteArray) {
+        // Only now touch the clipboard, on the main thread.
+        val text = String(data, java.nio.charset.StandardCharsets.UTF_8)
+        val now = System.currentTimeMillis()
+        lastAppliedContentHash = ClipboardHelper.contentHash(text)
+        lastAppliedTime = now
+        Looper.getMainLooper().let { mainLooper ->
+            android.os.Handler(mainLooper).post {
+                try {
+                    ClipboardHelper.setText(this@ClipcastService, text)
+                } catch (t: Throwable) {
+                    Log.w("ClipcastService", "setPrimaryClip failed", t)
+                }
+            }
+        }
+        lastRxTime = System.currentTimeMillis()
+        lastRxLen = data.size
+        lastRxIsImage = false
+        lastTransfer = "Received ${data.size} bytes"
+        publishState()
+    }
+
+    /**
+     * Image half: the fetch already verified length and SHA-256. Publish
+     * the bytes as a content URI under the announced MIME type, then arm
+     * hash-based echo suppression so our own clipboard write is never
+     * rebroadcast. Failures apply nothing.
+     */
+    private fun applyFetchedImage(job: FetchJob, data: ByteArray) {
+        val mime = job.mimeType
+        if (mime == null || !ClipboardHelper.isSupportedImageMime(mime)) {
+            Log.w("ClipcastService", "fetched image has no valid MIME; applying nothing")
+            return
+        }
+        val now = System.currentTimeMillis()
+        lastAppliedContentHash = ClipboardHelper.contentHashBytes(data)
+        lastAppliedTime = now
+        var published = false
+        Looper.getMainLooper().let { mainLooper ->
+            android.os.Handler(mainLooper).post {
+                try {
+                    published = ClipboardHelper.setImage(this@ClipcastService, mime, data) != null
+                } catch (t: Throwable) {
+                    Log.w("ClipcastService", "setPrimaryClip image failed", t)
+                }
+            }
+        }
+        // The clipboard write happens on the main thread; record the
+        // outcome optimistically — failures surface as a failed row only
+        // when setImage returns null synchronously is impossible here, so
+        // log verbosely instead.
+        lastRxTime = System.currentTimeMillis()
+        lastRxLen = data.size
+        lastRxIsImage = true
+        lastTransfer = "Received image $mime (${data.size} bytes)"
+        Log.d("ClipcastService", "received $mime (${data.size} bytes) published=$published")
+        publishState()
+    }
+
+    private fun finishFetch(generation: Int, transferStatus: String?, job: FetchJob) {
         synchronized(fetchLock) { activeFetches.remove(generation) }
-        lastTransfer = transferStatus
+        if (job.isImage) removeImageTransfer(job.transferId)
+        // Null status = success: apply* already recorded the outcome.
+        if (transferStatus != null) lastTransfer = transferStatus
         publishState()
     }
 
@@ -473,6 +665,7 @@ class ClipcastService : Service() {
             }
         }
         activeFetches.clear()
+        activeImageTransfers.clear()
     }
 
     private fun cancelActiveFetches(reason: String) {
@@ -560,7 +753,105 @@ class ClipcastService : Service() {
         }
     }
 
-    private fun broadcastSendResult(success: Boolean, length: Int, quiet: Boolean = false, tooLarge: Boolean = false) {
+    /**
+     * Send a staged image file (written by a foreground activity into our
+     * cache dir). The bytes are validated (allowlisted MIME, size ceiling),
+     * stored in the sender image cache, and announced over UDP; receivers
+     * fetch them over TCP. Over-limit or invalid images are logged by MIME
+     * and size only — never broadcast.
+     */
+    fun sendImageFile(stagedPath: String, mimeType: String, quiet: Boolean = false) {
+        // The staging file is ours (written by a foreground activity into
+        // our cache dir); always consume it, even when not sending.
+        val staged = File(stagedPath)
+        val bytes = try {
+            if (!staged.isFile) null else staged.readBytes()
+        } catch (e: Exception) {
+            null
+        }
+        try {
+            staged.delete()
+        } catch (e: Exception) {
+            // ignore
+        }
+        if (!isRunning) {
+            broadcastSendResult(false, 0, quiet, tooLarge = false, isImage = true)
+            return
+        }
+        if (!ClipboardHelper.isSupportedImageMime(mimeType)) {
+            Log.d("ClipcastService", "unsupported staged image MIME $mimeType; not sending")
+            broadcastSendResult(false, 0, quiet, tooLarge = false, isImage = true)
+            return
+        }
+        if (bytes == null || bytes.isEmpty()) {
+            broadcastSendResult(false, 0, quiet, tooLarge = false, isImage = true)
+            return
+        }
+        if (bytes.size.toLong() > LargeTextLimits.MAX_IMAGE_BYTES) {
+            Log.d("ClipcastService", "image not sent: $mimeType, ${bytes.size} bytes exceeds ${LargeTextLimits.MAX_IMAGE_BYTES} limit")
+            broadcastSendResult(false, bytes.size, quiet, tooLarge = true, isImage = true)
+            return
+        }
+
+        // Echo prevention: never rebroadcast an image we just applied.
+        val now = System.currentTimeMillis()
+        val hash = ClipboardHelper.contentHashBytes(bytes)
+        if (hash == lastAppliedContentHash && now - lastAppliedTime < 1000) {
+            Log.d("ClipcastService", "dropping echo of just-applied remote image")
+            return
+        }
+
+        sendExecutor.execute {
+            val keyBytes = preferences?.getKeyBytes() ?: return@execute
+            val deviceId = preferences?.deviceId ?: return@execute
+            val broadcastAddr = currentBroadcastAddress ?: return@execute
+            val port = currentPort
+            val cache = imageCache
+            if (cache == null) {
+                Log.w("ClipcastService", "no image cache; dropping image send")
+                broadcastSendResult(false, bytes.size, quiet, isImage = true)
+                return@execute
+            }
+
+            val nowMs = System.currentTimeMillis()
+            val lamport = syncState?.onLocalSend(nowMs, deviceId) ?: nowMs
+
+            // Store first (hash computed inside), then announce: receivers
+            // must be able to fetch the moment the datagram arrives.
+            val transferId = ImageCache.newTransferId()
+            cache.insert(transferId, mimeType, bytes)
+            val sha = TcpCrypto.sha256(bytes)
+            val tcpPort = preferences?.tcpPort ?: LargeTextLimits.DEFAULT_TCP_PORT
+            val announcePayload = try {
+                Crypto.encodeImageAnnouncePayload(
+                    transferId, bytes.size.toLong(), sha, tcpPort, mimeType
+                )
+            } catch (e: Exception) {
+                Log.w("ClipcastService", "image announce build failed", e)
+                broadcastSendResult(false, bytes.size, quiet, isImage = true)
+                return@execute
+            }
+            val datagram = Crypto.encodeImageAnnounce(
+                keyBytes, deviceId, lamport, nowMs, announcePayload
+            ) ?: return@execute
+
+            try {
+                val packet = DatagramPacket(datagram, datagram.size, broadcastAddr, port)
+                receiveSocket?.send(packet)
+
+                lastTxTime = System.currentTimeMillis()
+                lastTxLen = bytes.size
+                lastTxIsImage = true
+                publishState()
+                broadcastSendResult(true, bytes.size, quiet, isImage = true)
+            } catch (e: Exception) {
+                Log.w("ClipcastService", "Send error", e)
+                broadcastSendResult(false, bytes.size, quiet, isImage = true)
+            }
+        }
+    }
+
+    private fun broadcastSendResult(success: Boolean, length: Int, quiet: Boolean = false, tooLarge: Boolean = false, isImage: Boolean = false) {
         if (success) {
             lastSendOk = true
             lastSendError = null
@@ -588,6 +879,8 @@ class ClipcastService : Service() {
                 lastRxLen = lastRxLen,
                 lastTxTime = lastTxTime,
                 lastTxLen = lastTxLen,
+                lastRxIsImage = lastRxIsImage,
+                lastTxIsImage = lastTxIsImage,
                 lastTransfer = lastTransfer,
                 lastSendOk = lastSendOk,
                 lastSendError = lastSendError

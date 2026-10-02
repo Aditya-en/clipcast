@@ -37,6 +37,40 @@ pub fn report(cfg: &Config, config_path: &Path) -> String {
         out.push_str(&format!("  note:           {note}\n"));
     }
 
+    // Clipboard capabilities
+    out.push_str("  text_clipboard:  yes\n");
+    let mimes = plan.image_mime_types();
+    if mimes.is_empty() {
+        out.push_str("  image_clipboard: no (backend cannot supply images)\n");
+    } else {
+        out.push_str("  image_clipboard: yes\n");
+        out.push_str("  supported_image_mime_types:\n");
+        for m in &mimes {
+            out.push_str(&format!("    {m}\n"));
+        }
+    }
+
+    // Image transfer
+    let max_mib = cfg.max_image_bytes as f64 / (1024.0 * 1024.0);
+    out.push_str(&format!(
+        "  image_transfer: enabled (UDP announce + TCP fetch, same channel as large text)\n  max_image_size:  {cfg_max} bytes ({max_mib:.0} MiB)\n",
+        cfg_max = cfg.max_image_bytes,
+    ));
+    match crate::paths::image_cache_dir() {
+        Some(dir) => {
+            let state = if dir.is_dir() {
+                match std::fs::read_dir(&dir) {
+                    Ok(entries) => format!("OK ({} cached)", entries.count()),
+                    Err(e) => format!("ERROR: {e}"),
+                }
+            } else {
+                "not created yet (created on first image send)".to_string()
+            };
+            out.push_str(&format!("  image_cache:    {} — {state}\n", dir.display()));
+        }
+        None => out.push_str("  image_cache:    cannot determine state dir ($HOME unset)\n"),
+    }
+
     // Interfaces
     out.push_str("  interfaces:\n");
     let targets = discover(&cfg.interface_allow, &cfg.interface_deny);

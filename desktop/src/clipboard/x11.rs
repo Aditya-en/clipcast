@@ -1,10 +1,13 @@
 //! X11 backend: XFixes selection-notify driven change detection (x11rb).
 //!
 //! The main connection runs an event loop that detects ownership changes,
-//! reads the new selection content (UTF8_STRING, falling back to STRING, plus
-//! the KDE password-manager hint), and serves paste requests for content we
-//! applied ourselves. A second, private connection serves `get_text` so its
-//! synchronous SelectionNotify replies are never consumed by the event loop.
+//! reads the new selection content, and serves paste requests for content we
+//! applied ourselves. Text is read as UTF8_STRING (falling back to STRING,
+//! plus the KDE password-manager hint); images are read from the
+//! `image/png`, `image/jpeg`, or `image/webp` targets when the owner offers
+//! them (PNG preferred), and served back the same way. A second, private
+//! connection serves `get_text`/`get_image` so its synchronous
+//! SelectionNotify replies are never consumed by the event loop.
 
 use std::io;
 use std::sync::mpsc::Receiver;
@@ -23,12 +26,16 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::Subscribers;
-use crate::engine::{ClipboardBackend, ClipboardEvent};
+use crate::engine::{ClipboardBackend, ClipboardEvent, ClipboardImage};
 
-/// Cap selection reads at 256 KiB (units of 4 bytes). Anything larger is far
-/// beyond `max_text_bytes`, so it would be dropped by the engine anyway; the
-/// cap keeps a hostile or huge selection from ballooning memory.
+/// Cap text selection reads at 256 KiB (units of 4 bytes). Anything larger
+/// is far beyond `max_text_bytes`, so it would be dropped by the engine
+/// anyway; the cap keeps a hostile or huge selection from ballooning memory.
 const MAX_READ_UNITS: u32 = 65536;
+/// Cap image selection reads at 16 MiB (units of 4 bytes), matching the
+/// default `max_image_bytes`. Owners demanding INCR (`bytes_after != 0`)
+/// are skipped: we never hold a partial image.
+const MAX_IMAGE_READ_UNITS: u32 = 4 * 1024 * 1024;
 
 x11rb::atom_manager! {
     Atoms: AtomsCookie {
@@ -40,7 +47,31 @@ x11rb::atom_manager! {
         ATOM,
         READ_PROP: b"CLIPCAST_READ",
         PASSWORD_HINT: b"x-kde-passwordManagerHint",
+        IMAGE_PNG: b"image/png",
+        IMAGE_JPEG: b"image/jpeg",
+        IMAGE_WEBP: b"image/webp",
     }
+}
+
+/// Content we own and serve to pasting applications.
+#[derive(Default, Clone)]
+enum SelectionContent {
+    #[default]
+    Empty,
+    Text(String),
+    Image {
+        mime: String,
+        bytes: Vec<u8>,
+    },
+}
+
+/// Image targets in preference order (PNG first: lossless and universal).
+fn image_targets(atoms: &Atoms) -> [(Atom, &'static str); 3] {
+    [
+        (atoms.IMAGE_PNG, "image/png"),
+        (atoms.IMAGE_JPEG, "image/jpeg"),
+        (atoms.IMAGE_WEBP, "image/webp"),
+    ]
 }
 
 fn xerr(e: impl std::fmt::Display) -> io::Error {
@@ -122,7 +153,7 @@ pub(crate) fn create() -> io::Result<Box<dyn ClipboardBackend>> {
     let read_win = make_window(&conn_read, screen_read)?;
 
     let subs = Arc::new(Subscribers::default());
-    let content = Arc::new(Mutex::new(String::new()));
+    let content = Arc::new(Mutex::new(SelectionContent::default()));
 
     let thread_conn = Arc::clone(&conn);
     let thread_atoms = Arc::clone(&atoms);
@@ -147,9 +178,11 @@ pub(crate) fn create() -> io::Result<Box<dyn ClipboardBackend>> {
 #[derive(Default, PartialEq, Eq)]
 enum Stage {
     #[default]
+    Targets,
     Utf8,
     String,
     Hint,
+    Image,
 }
 
 #[derive(Default)]
@@ -159,13 +192,15 @@ struct ReadState {
     stage: Stage,
     text: String,
     timestamp: Timestamp,
+    image_mime: Option<String>,
+    image_target: Atom,
 }
 
 fn event_loop(
     conn: Arc<RustConnection>,
     atoms: Arc<Atoms>,
     subs: Arc<Subscribers>,
-    content: Arc<Mutex<String>>,
+    content: Arc<Mutex<SelectionContent>>,
     win: Window,
 ) {
     let mut state = ReadState::default();
@@ -216,15 +251,36 @@ fn start_read(
 ) -> io::Result<()> {
     state.pending = true;
     state.dirty = false;
-    state.stage = Stage::Utf8;
+    state.stage = Stage::Targets;
     state.timestamp = timestamp;
+    state.text.clear();
+    state.image_mime = None;
+    // Ask what the owner offers first: an image target wins over text.
+    conn.convert_selection(
+        win,
+        atoms.CLIPBOARD,
+        atoms.TARGETS,
+        atoms.READ_PROP,
+        timestamp,
+    )
+    .map_err(xerr)?;
+    conn.flush().map_err(xerr)
+}
+
+fn start_text_read(
+    conn: &RustConnection,
+    atoms: &Atoms,
+    win: Window,
+    state: &mut ReadState,
+) -> io::Result<()> {
+    state.stage = Stage::Utf8;
     state.text.clear();
     conn.convert_selection(
         win,
         atoms.CLIPBOARD,
         atoms.UTF8_STRING,
         atoms.READ_PROP,
-        timestamp,
+        state.timestamp,
     )
     .map_err(xerr)?;
     conn.flush().map_err(xerr)
@@ -241,8 +297,30 @@ fn finish_read(
     state.pending = false;
     let text = std::mem::take(&mut state.text);
     if !text.is_empty() {
-        subs.emit(ClipboardEvent { text, sensitive });
+        subs.emit(ClipboardEvent::text(text, sensitive));
     }
+    restart_if_dirty(conn, atoms, win, state)
+}
+
+/// Nothing readable came back: clear the read without emitting, then catch
+/// up if a newer change arrived mid-read.
+fn finish_empty(
+    conn: &RustConnection,
+    atoms: &Atoms,
+    win: Window,
+    state: &mut ReadState,
+) -> io::Result<()> {
+    state.pending = false;
+    state.text.clear();
+    restart_if_dirty(conn, atoms, win, state)
+}
+
+fn restart_if_dirty(
+    conn: &RustConnection,
+    atoms: &Atoms,
+    win: Window,
+    state: &mut ReadState,
+) -> io::Result<()> {
     if state.dirty {
         state.dirty = false;
         let owner = selection_owner(conn, atoms.CLIPBOARD);
@@ -262,6 +340,56 @@ fn advance_read(
     event: &SelectionNotifyEvent,
 ) -> io::Result<()> {
     match state.stage {
+        Stage::Targets => {
+            if event.property == 0 {
+                // Owner refuses TARGETS (old client): fall back to text.
+                return start_text_read(conn, atoms, win, state);
+            }
+            let reply = conn
+                .get_property(true, win, event.property, 0u32, 0, 1024)
+                .map_err(xerr)?
+                .reply()
+                .map_err(xerr)?;
+            let offered: Vec<Atom> = reply.value32().into_iter().flatten().collect();
+            if let Some((target, mime)) = image_targets(atoms)
+                .into_iter()
+                .find(|(t, _)| offered.contains(t))
+            {
+                state.stage = Stage::Image;
+                state.image_mime = Some(mime.to_string());
+                state.image_target = target;
+                conn.convert_selection(
+                    win,
+                    atoms.CLIPBOARD,
+                    target,
+                    atoms.READ_PROP,
+                    state.timestamp,
+                )
+                .map_err(xerr)?;
+                return conn.flush().map_err(xerr);
+            }
+            start_text_read(conn, atoms, win, state)
+        }
+        Stage::Image => {
+            if event.property == 0 {
+                // Image target refused after all: give up quietly.
+                return finish_empty(conn, atoms, win, state);
+            }
+            let reply = conn
+                .get_property(true, win, event.property, 0u32, 0, MAX_IMAGE_READ_UNITS)
+                .map_err(xerr)?
+                .reply()
+                .map_err(xerr)?;
+            let mime = state.image_mime.clone().unwrap_or_default();
+            if reply.bytes_after != 0 || reply.value.is_empty() {
+                // INCR-size or empty: never emit a partial image.
+                debug!("skipping x11 image: oversize or empty ({mime})");
+                return finish_empty(conn, atoms, win, state);
+            }
+            state.pending = false;
+            subs.emit(ClipboardEvent::image(mime, reply.value));
+            restart_if_dirty(conn, atoms, win, state)
+        }
         Stage::Utf8 | Stage::String => {
             if event.property == 0 {
                 if state.stage == Stage::Utf8 {
@@ -322,10 +450,10 @@ fn advance_read(
 fn serve_request(
     conn: &RustConnection,
     atoms: &Atoms,
-    content: &Mutex<String>,
+    content: &Mutex<SelectionContent>,
     event: &SelectionRequestEvent,
 ) -> io::Result<()> {
-    let text = content
+    let content = content
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default();
@@ -338,35 +466,63 @@ fn serve_request(
     // 0 in the reply means "refused" (property None per ICCCM).
     let mut reply_property = 0;
     if event.target == atoms.TARGETS {
+        let mut targets = vec![atoms.TARGETS, atoms.UTF8_STRING, atoms.STRING, atoms.TEXT];
+        if let SelectionContent::Image { .. } = content {
+            targets.extend(image_targets(atoms).iter().map(|(t, _)| *t));
+        }
         conn.change_property32(
             PropMode::REPLACE,
             event.requestor,
             property,
             atoms.ATOM,
-            &[atoms.TARGETS, atoms.UTF8_STRING, atoms.STRING, atoms.TEXT],
+            &targets,
         )
         .map_err(xerr)?;
         reply_property = property;
-    } else if event.target == atoms.UTF8_STRING || event.target == atoms.TEXT {
-        conn.change_property8(
-            PropMode::REPLACE,
-            event.requestor,
-            property,
-            atoms.UTF8_STRING,
-            text.as_bytes(),
-        )
-        .map_err(xerr)?;
-        reply_property = property;
-    } else if event.target == atoms.STRING {
-        conn.change_property8(
-            PropMode::REPLACE,
-            event.requestor,
-            property,
-            atoms.STRING,
-            text.as_bytes(),
-        )
-        .map_err(xerr)?;
-        reply_property = property;
+    }
+    match (&content, event.target) {
+        (SelectionContent::Text(text), t) if t == atoms.UTF8_STRING || t == atoms.TEXT => {
+            conn.change_property8(
+                PropMode::REPLACE,
+                event.requestor,
+                property,
+                atoms.UTF8_STRING,
+                text.as_bytes(),
+            )
+            .map_err(xerr)?;
+            reply_property = property;
+        }
+        (SelectionContent::Text(text), t) if t == atoms.STRING => {
+            conn.change_property8(
+                PropMode::REPLACE,
+                event.requestor,
+                property,
+                atoms.STRING,
+                text.as_bytes(),
+            )
+            .map_err(xerr)?;
+            reply_property = property;
+        }
+        (SelectionContent::Image { mime, bytes }, t)
+            if image_targets(atoms).iter().any(|(a, _)| *a == t) =>
+        {
+            let target_atom = image_targets(atoms)
+                .into_iter()
+                .find(|(a, _)| *a == t)
+                .map(|(a, _)| a)
+                .unwrap_or(atoms.IMAGE_PNG);
+            debug!("serving x11 image ({mime}) for paste");
+            conn.change_property8(
+                PropMode::REPLACE,
+                event.requestor,
+                property,
+                target_atom,
+                bytes,
+            )
+            .map_err(xerr)?;
+            reply_property = property;
+        }
+        _ => {}
     }
     // Everything else — including the password-manager hint, which we never
     // claim for content we applied from the network — is refused.
@@ -392,44 +548,106 @@ struct X11Backend {
     win: Window,
     read_win: Window,
     atoms: Arc<Atoms>,
-    content: Arc<Mutex<String>>,
+    content: Arc<Mutex<SelectionContent>>,
+}
+
+/// Convert a selection on the private read connection and return the raw
+/// property bytes, or `None` when the target is refused/empty/oversize.
+fn read_target_once(
+    conn: &RustConnection,
+    atoms: &Atoms,
+    read_win: Window,
+    target: Atom,
+    max_units: u32,
+) -> io::Result<Option<Vec<u8>>> {
+    conn.convert_selection(
+        read_win,
+        atoms.CLIPBOARD,
+        target,
+        atoms.READ_PROP,
+        x11rb::CURRENT_TIME,
+    )
+    .map_err(xerr)?
+    .check()
+    .map_err(xerr)?;
+    loop {
+        let event = conn.wait_for_event().map_err(xerr)?;
+        let Event::SelectionNotify(e) = event else {
+            continue;
+        };
+        if e.requestor != read_win {
+            continue;
+        }
+        if e.property == 0 {
+            return Ok(None);
+        }
+        let reply = conn
+            .get_property(true, read_win, e.property, 0u32, 0, max_units)
+            .map_err(xerr)?
+            .reply()
+            .map_err(xerr)?;
+        if reply.value.is_empty() || reply.bytes_after != 0 {
+            return Ok(None);
+        }
+        return Ok(Some(reply.value));
+    }
+}
+
+/// List the atoms the current selection owner offers, if it cooperates.
+fn read_offered_targets(
+    conn: &RustConnection,
+    atoms: &Atoms,
+    read_win: Window,
+) -> io::Result<Vec<Atom>> {
+    match read_target_once(conn, atoms, read_win, atoms.TARGETS, 1024)? {
+        Some(bytes) => {
+            let (chunks, rest) = bytes.as_chunks::<4>();
+            if !rest.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(chunks.iter().copied().map(Atom::from_ne_bytes).collect())
+        }
+        None => Ok(Vec::new()),
+    }
 }
 
 impl ClipboardBackend for X11Backend {
     fn get_text(&self) -> io::Result<Option<String>> {
         for target in [self.atoms.UTF8_STRING, self.atoms.STRING] {
-            self.conn_read
-                .convert_selection(
-                    self.read_win,
-                    self.atoms.CLIPBOARD,
-                    target,
-                    self.atoms.READ_PROP,
-                    x11rb::CURRENT_TIME,
-                )
-                .map_err(xerr)?
-                .check()
-                .map_err(xerr)?;
-            loop {
-                let event = self.conn_read.wait_for_event().map_err(xerr)?;
-                let Event::SelectionNotify(e) = event else {
-                    continue;
-                };
-                if e.requestor != self.read_win {
-                    continue;
+            match read_target_once(
+                &self.conn_read,
+                &self.atoms,
+                self.read_win,
+                target,
+                MAX_READ_UNITS,
+            )? {
+                Some(bytes) => return Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+                None => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_image(&self) -> io::Result<Option<ClipboardImage>> {
+        let offered = read_offered_targets(&self.conn_read, &self.atoms, self.read_win)?;
+        for (target, mime) in image_targets(&self.atoms) {
+            if !offered.contains(&target) {
+                continue;
+            }
+            match read_target_once(
+                &self.conn_read,
+                &self.atoms,
+                self.read_win,
+                target,
+                MAX_IMAGE_READ_UNITS,
+            )? {
+                Some(bytes) => {
+                    return Ok(Some(ClipboardImage {
+                        mime_type: mime.to_string(),
+                        bytes,
+                    }));
                 }
-                if e.property == 0 {
-                    break; // Target refused; try the next one.
-                }
-                let reply = self
-                    .conn_read
-                    .get_property(true, self.read_win, e.property, 0u32, 0, MAX_READ_UNITS)
-                    .map_err(xerr)?
-                    .reply()
-                    .map_err(xerr)?;
-                if reply.value.is_empty() || reply.bytes_after != 0 {
-                    return Ok(None);
-                }
-                return Ok(Some(String::from_utf8_lossy(&reply.value).into_owned()));
+                None => continue,
             }
         }
         Ok(None)
@@ -441,18 +659,51 @@ impl ClipboardBackend for X11Backend {
                 .content
                 .lock()
                 .map_err(|_| io::Error::other("selection content poisoned"))?;
-            *guard = text.to_owned();
+            *guard = SelectionContent::Text(text.to_owned());
+        }
+        self.take_ownership()
+    }
+
+    fn set_image(&self, image: &ClipboardImage) -> io::Result<()> {
+        if !crate::proto::is_supported_image_mime(&image.mime_type) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported image MIME {}", image.mime_type),
+            ));
+        }
+        {
+            let mut guard = self
+                .content
+                .lock()
+                .map_err(|_| io::Error::other("selection content poisoned"))?;
+            *guard = SelectionContent::Image {
+                mime: image.mime_type.clone(),
+                bytes: image.bytes.clone(),
+            };
         }
         // Publish content before taking ownership so a paste racing us sees
-        // the new text.
+        // the new image.
+        self.take_ownership()
+    }
+
+    fn image_mime_types(&self) -> Vec<String> {
+        image_targets(&self.atoms)
+            .into_iter()
+            .map(|(_, m)| m.to_string())
+            .collect()
+    }
+
+    fn subscribe_changes(&self) -> Receiver<ClipboardEvent> {
+        self.subs.subscribe()
+    }
+}
+
+impl X11Backend {
+    fn take_ownership(&self) -> io::Result<()> {
         self.conn
             .set_selection_owner(self.win, self.atoms.CLIPBOARD, x11rb::CURRENT_TIME)
             .map_err(|e| io::Error::other(format!("take selection ownership: {e}")))?
             .check()
             .map_err(|e| io::Error::other(format!("take selection ownership: {e}")))
-    }
-
-    fn subscribe_changes(&self) -> Receiver<ClipboardEvent> {
-        self.subs.subscribe()
     }
 }

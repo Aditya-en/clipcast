@@ -347,6 +347,13 @@
                 android:textSize="13sp"
                 android:fontFamily="monospace"
                 android:textColor="?android:attr/textColorSecondary" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/about_images"
+                android:textSize="13sp"
+                android:textColor="?android:attr/textColorSecondary" />
         </LinearLayout>
     </LinearLayout>
 </ScrollView>

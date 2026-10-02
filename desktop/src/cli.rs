@@ -122,6 +122,9 @@ fn run_daemon(log_content: bool) -> Result<(), CliError> {
         max_text_bytes: inline_max,
         inline_max_bytes: inline_max,
         max_transfer_bytes: cfg.max_transfer_bytes,
+        max_image_bytes: cfg.max_image_bytes,
+        image_cache_ttl: std::time::Duration::from_secs(cfg.image_cache_ttl_secs),
+        max_cached_images: cfg.max_cached_images,
         tcp_port: cfg.tcp_port,
         transfer_ttl: std::time::Duration::from_secs(cfg.transfer_ttl_secs),
         fetch_timeout: std::time::Duration::from_secs(cfg.fetch_timeout_secs),
@@ -129,11 +132,34 @@ fn run_daemon(log_content: bool) -> Result<(), CliError> {
         log_content,
         ..EngineConfig::default()
     };
-    let engine = Engine::new(backend, transport, engine_cfg);
+    let mut engine = Engine::new(backend, transport, engine_cfg);
 
-    // TCP side channel for large text, for the daemon's lifetime. If the
-    // port is taken (e.g. a second instance on one machine), inline sync
-    // keeps working; only serving large transfers is unavailable here.
+    // Sender-side image disk cache, shared with the TCP listener below. If
+    // the cache cannot be created, image sync is disabled but text sync
+    // keeps working.
+    let image_cache = {
+        let dir = crate::paths::image_cache_dir()
+            .unwrap_or_else(|| std::env::temp_dir().join("clipcast-images"));
+        match crate::image_cache::ImageCache::new(
+            dir,
+            std::time::Duration::from_secs(cfg.image_cache_ttl_secs),
+            cfg.max_cached_images,
+        ) {
+            Ok(cache) => {
+                let arc = std::sync::Arc::new(std::sync::Mutex::new(cache));
+                engine.set_image_cache(std::sync::Arc::clone(&arc));
+                Some(arc)
+            }
+            Err(e) => {
+                tracing::warn!("image cache unavailable ({e}); image sync disabled");
+                None
+            }
+        }
+    };
+
+    // TCP side channel for large text and images, for the daemon's lifetime.
+    // If the port is taken (e.g. a second instance on one machine), inline
+    // sync keeps working; only serving large transfers is unavailable here.
     match crate::tcp_server::bind_listener(cfg.tcp_port) {
         Ok(listener) => {
             tracing::info!(port = cfg.tcp_port, "TCP transfer listener bound");
@@ -141,6 +167,7 @@ fn run_daemon(log_content: bool) -> Result<(), CliError> {
                 listener,
                 key,
                 engine.transfer_store(),
+                image_cache,
                 crate::tcp_server::IDLE_TIMEOUT,
                 std::time::Duration::from_secs(cfg.fetch_timeout_secs),
             );

@@ -52,7 +52,15 @@ pub fn generate_transfer_id() -> [u8; 16] {
 
 /// Short non-cryptographic hash of content, used for echo suppression.
 pub fn content_hash(text: &str) -> u64 {
-    let digest = Sha256::digest(text.as_bytes());
+    content_hash_bytes(text.as_bytes())
+}
+
+/// Byte-oriented variant for non-text content (e.g. image bytes): the
+/// first 8 bytes of SHA-256, big-endian. Text and image hashes share one
+/// suppression namespace, so an image that byte-matches a recent text (or
+/// vice versa) still suppresses correctly.
+pub fn content_hash_bytes(bytes: &[u8]) -> u64 {
+    let digest = Sha256::digest(bytes);
     u64::from_be_bytes(digest[0..8].try_into().unwrap())
 }
 

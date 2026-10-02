@@ -1,4 +1,4 @@
-//! TCP listener serving pending large-text transfers.
+//! TCP listener serving pending large-text transfers and cached images.
 //!
 //! Synchronous (`std::net`), matching the daemon's threading model: one
 //! accept loop thread, one worker thread per connection, at most
@@ -11,6 +11,10 @@
 //! closes the connection silently without writing a response, and it
 //! allocates nothing proportional to attacker-controlled values before the
 //! tag verifies (fixed 86-byte read, fixed-size arrays, map lookup only).
+//!
+//! Images ride the exact same channel: after authentication the server looks
+//! the transfer id up in the large-text store first, then in the image disk
+//! cache. The framing, chunking, and AEAD properties are identical.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -22,6 +26,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::crypto::KeyBytes;
+use crate::image_cache::ImageCache;
 use crate::tcp::{
     DIR_SERVER_TO_CLIENT, FLAG_FINAL, MAX_FRAME_DATA, REQUEST_HEADER_LEN, TAG_LEN,
     decode_request_header, derive_session_key, seal_frame, verify_handshake,
@@ -53,6 +58,7 @@ pub fn serve_forever(
     listener: TcpListener,
     key: KeyBytes,
     store: Arc<Mutex<TransferStore>>,
+    images: Option<Arc<Mutex<ImageCache>>>,
     idle_timeout: Duration,
     total_timeout: Duration,
 ) {
@@ -68,9 +74,10 @@ pub fn serve_forever(
             continue;
         }
         active.fetch_add(1, Ordering::SeqCst);
-        let (key, store, active) = (key, Arc::clone(&store), Arc::clone(&active));
+        let (key, store, images, active) =
+            (key, Arc::clone(&store), images.clone(), Arc::clone(&active));
         std::thread::spawn(move || {
-            handle_connection(stream, &key, &store, idle_timeout, total_timeout);
+            handle_connection(stream, &key, &store, &images, idle_timeout, total_timeout);
             active.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -81,16 +88,20 @@ pub fn spawn_server(
     listener: TcpListener,
     key: KeyBytes,
     store: Arc<Mutex<TransferStore>>,
+    images: Option<Arc<Mutex<ImageCache>>>,
     idle_timeout: Duration,
     total_timeout: Duration,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || serve_forever(listener, key, store, idle_timeout, total_timeout))
+    std::thread::spawn(move || {
+        serve_forever(listener, key, store, images, idle_timeout, total_timeout)
+    })
 }
 
 fn handle_connection(
     mut stream: TcpStream,
     key: &KeyBytes,
     store: &Arc<Mutex<TransferStore>>,
+    images: &Option<Arc<Mutex<ImageCache>>>,
     idle_timeout: Duration,
     total_timeout: Duration,
 ) {
@@ -117,10 +128,17 @@ fn handle_connection(
         return;
     }
     // Authenticated: look up the transfer and record one fetch against its
-    // budget. Unknown, expired, or exhausted ids close silently too.
+    // budget. Large texts come from the pending store; images from the disk
+    // cache. Unknown, expired, or exhausted ids close silently too.
     let (data, _sha) = match store.lock().unwrap().serve(&req.transfer_id) {
         Some(v) => v,
-        None => return,
+        None => match images
+            .as_ref()
+            .and_then(|c| c.lock().unwrap().serve(&req.transfer_id))
+        {
+            Some((bytes, _mime, sha)) => (Arc::from(bytes.into_boxed_slice()), sha),
+            None => return,
+        },
     };
     let _ = stream.set_read_timeout(Some(idle_timeout));
 
@@ -220,10 +238,12 @@ mod tests {
         store.lock().unwrap().insert(transfer_id, data.to_vec());
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
+        let (images, _dir) = crate::image_cache::temp_image_cache(Duration::from_secs(120), 20);
         spawn_server(
             listener,
             KEY,
             store,
+            Some(images),
             Duration::from_secs(10),
             Duration::from_secs(60),
         );

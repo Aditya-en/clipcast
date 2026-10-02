@@ -42,6 +42,11 @@ pub fn device_id_file() -> Option<PathBuf> {
     state_dir().map(|d| d.join("device_id"))
 }
 
+/// `~/.local/state/clipcast/images` — temporary sender-side image cache.
+pub fn image_cache_dir() -> Option<PathBuf> {
+    state_dir().map(|d| d.join("images"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

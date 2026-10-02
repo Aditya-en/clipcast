@@ -24,6 +24,19 @@ object LargeTextLimits {
     /** Default cap on text we will serve to peers (16 MiB). */
     const val DEFAULT_MAX_SEND_BYTES = 16 * 1024 * 1024
 
+    /**
+     * Default cap on one image, send or receive (16 MiB). Larger local
+     * images are never announced; larger remote announces are never
+     * fetched — a malicious peer cannot make us allocate beyond this.
+     */
+    const val MAX_IMAGE_BYTES = 16 * 1024 * 1024L
+
+    /** Sender image-cache lifetime: peers may fetch during this TTL. */
+    const val IMAGE_CACHE_TTL_MS = 600_000L
+
+    /** Keep only the newest N sent images; evict oldest first. */
+    const val MAX_CACHED_IMAGES = 20
+
     /** Pending-transfer lifetime: peers may fetch during this TTL. */
     const val TRANSFER_TTL_MS = 120_000L
 

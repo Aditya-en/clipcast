@@ -162,4 +162,35 @@ class StatusMapperTest {
         assertTrue(ready.sendEnabled)
         assertNull(ready.sendReason)
     }
+
+    @Test
+    fun imageRows_carryIsImageFlag() {
+        val screen = StatusMapper.map(
+            base().copy(
+                lastRxTime = 1000, lastRxLen = 2400000, lastRxIsImage = true,
+                lastTxTime = 2000, lastTxLen = 1800000, lastTxIsImage = true
+            )
+        )
+        assertEquals(true, screen.received?.isImage)
+        assertEquals(true, screen.sent?.isImage)
+        assertEquals(2400000L, screen.received?.bytes)
+
+        val text = StatusMapper.map(
+            base().copy(lastRxTime = 1000, lastRxLen = 812)
+        )
+        assertEquals(false, text.received?.isImage)
+    }
+
+    @Test
+    fun syncLimitDetail_shownForOversizeImages() {
+        assertEquals(
+            "Too large to sync",
+            StatusMapper.receiveFailureDetail("Image exceeds the 16 MB sync limit (25000000 bytes)")
+        )
+        // Text failures keep their existing wording.
+        assertEquals(
+            "Too large for this phone's clipboard",
+            StatusMapper.receiveFailureDetail("Text too large for the Android clipboard (1000 bytes, max 512)")
+        )
+    }
 }

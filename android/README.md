@@ -5,6 +5,7 @@ A lightweight LAN clipboard sync client for Android. Interoperates with the desk
 ## Features
 
 - **Text sync** (v1 + v2 side channel): short text over UDP, large text (up to 16 MiB sends) over an encrypted TCP side channel
+- **Image sync**: PNG/JPEG/WebP clipboard images (up to 16 MiB) via UDP announce + encrypted TCP fetch, same channel as large text
 - **Minimal dependencies**: Android SDK + Kotlin stdlib only (no third-party libraries)
 - **Tiny APK**: ~200KB release build with R8 shrinking
 - **Low battery**: Foreground service with MulticastLock, no wake lock
@@ -31,6 +32,21 @@ Text over the 1200 byte UDP limit syncs via a TCP side channel:
 - Timeouts: 3 s connect, 3 s handshake read, 10 s idle per read, 120 s overall per transfer. At most 2 concurrent fetches (a newer accepted message cancels an older one) and 4 concurrent inbound connections (extras closed immediately).
 
 See [clipcast/docs/test-vectors.md](../desktop/docs/test-vectors.md) and [clipcast/docs/test-vectors-v2.md](../desktop/docs/test-vectors-v2.md) for cross-implementation test vectors.
+
+### Images (same TCP side channel)
+
+Copying/sharing an image (`image/png`, `image/jpeg`, `image/webp`, up to
+16 MiB) sends one UDP image announce — the 59-byte base announce with
+inner `0x02` plus `mime_len(1) + MIME` — and serves the bytes from an
+app-private disk cache (`send_images/`, 10-minute TTL, newest 20) over the
+same authenticated TCP channel. Receiving writes the verified bytes to
+`cacheDir/clipboard_images/` and publishes a content URI
+(`com.clipcast.imageprovider`, read-only, no `file://` URIs) so other apps
+can paste it; nothing touches the clipboard before SHA-256 verification,
+and a newer update arriving mid-download wins over the stale image. A
+re-announced in-flight transfer never starts a second download. Image
+vectors: [clipcast/docs/test-vectors-image.md](../desktop/docs/test-vectors-image.md)
+(byte-exact Kotlin test in `ImageVectorTest`).
 
 ## Build
 
@@ -67,6 +83,14 @@ Requires:
 | **Send now button** | In-app button → sends current clipboard |
 
 Small text (≤ 1200 bytes) goes over UDP as before. Larger text (up to 16 MiB) is served from the phone over TCP: the app announces it once over UDP and serves fetches while the foreground service is alive. Past 16 MiB the app tells you the text is too large.
+
+An image in the clipboard (or shared via Share → Clipcast) takes the same
+5 paths and wins over text: the "Send clipboard now" label never changes,
+but the button flash and Activity rows read "Sent · Image · 2.4 MB" /
+"Received Image · 2.4 MB". Oversize images report "Image is too large to
+sync. Maximum: 16 MB". Automatic sending stays foreground-only (Android
+10+ blocks background clipboard reads); receiving works with the screen
+off while the service is alive.
 
 ### Receiving
 

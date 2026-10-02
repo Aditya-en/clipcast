@@ -32,6 +32,7 @@
     <string name="ports_same">UDP and TCP ports must differ</string>
     <string name="ports_restarted">Ports updated — sync restarted</string>
     <string name="about_protocol">protocol v1 + TCP v1</string>
+    <string name="about_images">Images: PNG · JPEG · WebP up to 16 MB via encrypted TCP</string>
     <string name="about_version">Version %1$s (%2$d)</string>
     <string name="key_fingerprint">Fingerprint  %1$s</string>
     <string name="desc_settings">Settings</string>
@@ -49,6 +50,10 @@
     <string name="activity_sent">Sent</string>
     <string name="activity_empty">Nothing yet. Copy something on another device.</string>
     <string name="send_sent">Sent · %1$s</string>
+    <string name="send_sent_image">Sent · Image · %1$s</string>
+    <string name="send_image_too_large">Image is too large to sync. Maximum: 16 MB</string>
+    <string name="activity_image_size">Image · %1$s</string>
+    <string name="toast_sent_image">Sent image · %1$s</string>
     <string name="send_reason_no_key">Add your key in Settings to send</string>
     <string name="send_reason_off">Turn sync on to send</string>
     <string name="send_empty">Copy something first</string>

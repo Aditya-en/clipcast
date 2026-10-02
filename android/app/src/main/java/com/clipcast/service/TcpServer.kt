@@ -12,7 +12,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * TCP listener serving pending large-text transfers to LAN peers.
+ * TCP listener serving pending large-text transfers (and cached images) to
+ * LAN peers.
  *
  * Bound to all interfaces on [port]; one accept thread plus a bounded worker
  * pool ([LargeTextLimits.MAX_SERVER_CONNECTIONS] concurrent connections —
@@ -25,6 +26,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * closes silently with no response. Nothing sized by attacker input is
  * allocated before authentication (fixed 86-byte read, map lookup only).
  *
+ * Images ride the exact same channel: after authentication the transfer id
+ * is looked up in the text store first, then in the image disk cache.
+ *
  * Power note: the listener only works while the service is alive, and Doze
  * may delay it (see README).
  */
@@ -32,6 +36,7 @@ class TcpServer(
     private val port: Int,
     private val keyProvider: () -> ByteArray?,
     private val store: TransferStore,
+    private val imageCache: ImageCache? = null,
     private val idleTimeoutMs: Int = LargeTextLimits.IDLE_TIMEOUT_MS,
     private val totalTimeoutMs: Long = LargeTextLimits.TOTAL_TIMEOUT_MS,
     private val maxConnections: Int = LargeTextLimits.MAX_SERVER_CONNECTIONS,
@@ -175,8 +180,13 @@ class TcpServer(
             }
             if (!TcpCrypto.verifyHandshake(sessionKey, headerBytes, tag)) return
             // Authenticated: look up the transfer and record one fetch.
-            // Unknown, expired, or exhausted ids close silently too.
-            val (data, _) = store.serve(req.transferId) ?: return
+            // Large texts come from the pending store; images from the disk
+            // cache. Unknown, expired, or exhausted ids close silently too.
+            val (data, _) = store.serve(req.transferId)
+                ?: imageCache?.serve(req.transferId)?.let { (bytes, _, sha) ->
+                    Pair(bytes, sha)
+                }
+                ?: return
             try {
                 socket.soTimeout = idleTimeoutMs
             } catch (e: Exception) {

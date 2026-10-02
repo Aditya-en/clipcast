@@ -277,10 +277,12 @@ mod tests {
         let store = serving_store(data, id);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
+        let (images, _dir) = crate::image_cache::temp_image_cache(Duration::from_secs(120), 20);
         crate::tcp_server::spawn_server(
             listener,
             KEY,
             store,
+            Some(images),
             Duration::from_secs(10),
             Duration::from_secs(30),
         );
@@ -298,10 +300,12 @@ mod tests {
         let store = serving_store(&data, id);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
+        let (images, _dir) = crate::image_cache::temp_image_cache(Duration::from_secs(120), 20);
         crate::tcp_server::spawn_server(
             listener,
             KEY,
             store,
+            Some(images),
             Duration::from_secs(10),
             Duration::from_secs(60),
         );
@@ -318,10 +322,12 @@ mod tests {
         let store = serving_store(data, id);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
+        let (images, _dir) = crate::image_cache::temp_image_cache(Duration::from_secs(120), 20);
         crate::tcp_server::spawn_server(
             listener,
             KEY,
             store,
+            Some(images),
             Duration::from_secs(10),
             Duration::from_secs(30),
         );
@@ -343,10 +349,12 @@ mod tests {
         let store = serving_store(data, id);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
+        let (images, _dir) = crate::image_cache::temp_image_cache(Duration::from_secs(120), 20);
         crate::tcp_server::spawn_server(
             listener,
             KEY,
             store,
+            Some(images),
             Duration::from_secs(10),
             Duration::from_secs(30),
         );

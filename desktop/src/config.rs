@@ -13,6 +13,10 @@ pub const DEFAULT_INLINE_MAX_BYTES: usize = 1200;
 pub const DEFAULT_MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_TRANSFER_TTL_SECS: u64 = 120;
 pub const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 120;
+/// Image defaults: per-image ceiling, sender cache TTL and entry cap.
+pub const DEFAULT_MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_IMAGE_CACHE_TTL_SECS: u64 = 600;
+pub const DEFAULT_MAX_CACHED_IMAGES: usize = 20;
 
 /// Clipboard backend selection. `Auto` picks from the session environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -41,6 +45,13 @@ pub struct Config {
     pub transfer_ttl_secs: u64,
     /// Overall cap for one incoming TCP fetch.
     pub fetch_timeout_secs: u64,
+    /// Per-image ceiling in bytes; larger local images are never sent, and
+    /// larger remote announces are never fetched.
+    pub max_image_bytes: u64,
+    /// How long a sent image stays fetchable from the disk cache.
+    pub image_cache_ttl_secs: u64,
+    /// Maximum images retained in the sender disk cache.
+    pub max_cached_images: usize,
     pub poll_interval_ms: u64,
     pub skip_sensitive: bool,
     pub backend: BackendOverride,
@@ -61,6 +72,9 @@ impl Default for Config {
             tcp_port: DEFAULT_TCP_PORT,
             transfer_ttl_secs: DEFAULT_TRANSFER_TTL_SECS,
             fetch_timeout_secs: DEFAULT_FETCH_TIMEOUT_SECS,
+            max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
+            image_cache_ttl_secs: DEFAULT_IMAGE_CACHE_TTL_SECS,
+            max_cached_images: DEFAULT_MAX_CACHED_IMAGES,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             skip_sensitive: true,
             backend: BackendOverride::Auto,
@@ -153,6 +167,9 @@ mod tests {
         assert_eq!(c.tcp_port, 47475);
         assert_eq!(c.transfer_ttl_secs, 120);
         assert_eq!(c.fetch_timeout_secs, 120);
+        assert_eq!(c.max_image_bytes, 16 * 1024 * 1024);
+        assert_eq!(c.image_cache_ttl_secs, 600);
+        assert_eq!(c.max_cached_images, 20);
         assert_eq!(c.poll_interval_ms, 300);
         assert!(c.skip_sensitive);
         assert_eq!(c.backend, BackendOverride::Auto);

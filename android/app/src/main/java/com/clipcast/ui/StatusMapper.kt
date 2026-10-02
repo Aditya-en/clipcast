@@ -26,7 +26,9 @@ object StatusMapper {
         /** Check (true) or cross (false) glyph. */
         val ok: Boolean,
         /** Plain-words second line, or null. */
-        val detail: String? = null
+        val detail: String? = null,
+        /** Row describes an image ("Image · 2.4 MB"), not text. */
+        val isImage: Boolean = false
     )
 
     data class MainScreen(
@@ -91,7 +93,8 @@ object StatusMapper {
             timeMs = s.lastRxTime,
             bytes = s.lastRxLen.toLong(),
             ok = true,
-            detail = receiveFailureDetail(s.lastTransfer)
+            detail = receiveFailureDetail(s.lastTransfer),
+            isImage = s.lastRxIsImage
         )
     }
 
@@ -106,7 +109,8 @@ object StatusMapper {
                 "too_large" -> "Too large to send"
                 "failed" -> "Couldn't send"
                 else -> null
-            }
+            },
+            isImage = s.lastTxIsImage
         )
     }
 
@@ -115,6 +119,9 @@ object StatusMapper {
      * Service wording in, plain words out.
      */
     fun receiveFailureDetail(lastTransfer: String): String? {
+        if (lastTransfer.contains("sync limit", ignoreCase = true)) {
+            return "Too large to sync"
+        }
         if (lastTransfer.contains("too large", ignoreCase = true)) {
             return "Too large for this phone's clipboard"
         }

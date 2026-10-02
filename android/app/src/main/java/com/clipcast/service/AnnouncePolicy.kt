@@ -38,4 +38,26 @@ object AnnouncePolicy {
         }
         return Decision.FETCH
     }
+
+    /**
+     * Image-announce gate: same shape as [decide], but the ceiling is the
+     * image limit and the MIME type must be allowlisted. The SHA comparand
+     * is the hex of the image bytes — never a URI string.
+     */
+    fun decideImage(
+        totalLen: Long,
+        maxImageBytes: Long,
+        mimeType: String,
+        announceShaHex: String,
+        lastAppliedContentHashHex: String?
+    ): Decision {
+        if (java.lang.Long.compareUnsigned(totalLen, maxImageBytes) > 0) {
+            return Decision.SKIP_OVER_LIMIT
+        }
+        if (!Crypto.isSupportedImageMime(mimeType)) return Decision.SKIP_UNKNOWN_TYPE
+        if (lastAppliedContentHashHex != null && announceShaHex.equals(lastAppliedContentHashHex, ignoreCase = true)) {
+            return Decision.SKIP_DUPLICATE
+        }
+        return Decision.FETCH
+    }
 }

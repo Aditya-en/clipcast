@@ -9,20 +9,25 @@ LAN clipboard sync: copy on one device, paste on another. Encrypted
 | [`android/`](android/) | Android client (8.0+, framework UI only) | Kotlin, Android SDK only |
 
 Both speak the same wire protocol: v1 UDP datagrams for short text plus a
-v2 TCP side channel for large text (announce + encrypted fetch). The
-cross-implementation test vectors in [`desktop/docs/`](desktop/docs/)
+v2 TCP side channel for large text and images (announce + encrypted fetch).
+The cross-implementation test vectors in [`desktop/docs/`](desktop/docs/)
 are the contract between them.
 
 ## Security limits (read before running)
 
 - One shared 32-byte key (base64, `clipcast keygen`) encrypts everything.
-  Anyone with the key — and LAN access — can read the clipboard traffic.
+  Anyone with the key — and LAN access — can read the clipboard traffic,
+  text and images alike.
 - Keys live in plaintext: `~/.config/clipcast/key` on desktop, app-private
   `SharedPreferences` on Android. Protect the machines, not just the key.
 - No forward secrecy, no replay protection beyond Lamport ordering, no
   hardening against a malicious LAN peer beyond authentication.
-- Android applies at most ~512 KiB per paste (Binder limit); larger
-  transfers are refused, never partially applied.
+- Image sizes and timing leak as metadata, and sent images sit temporarily
+  on disk so peers can fetch them: `~/.local/state/clipcast/images/` on
+  desktop (0600, 10-minute TTL), app-private cache on Android.
+- Android applies at most ~512 KiB per text paste (Binder limit); larger
+  transfers are refused, never partially applied. Images paste as content
+  URIs, so the Binder limit does not apply to them (16 MiB sync limit).
 
 ## Layout
 

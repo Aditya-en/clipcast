@@ -151,6 +151,20 @@ impl BackendPlan {
             }
         }
     }
+
+    /// Image MIME types this plan can supply, without instantiating a
+    /// backend (for `doctor` diagnostics).
+    pub fn image_mime_types(self) -> Vec<String> {
+        match self {
+            // Both native backends transfer the owner's original bytes.
+            BackendPlan::X11 | BackendPlan::Wayland => crate::proto::SUPPORTED_IMAGE_MIMES
+                .iter()
+                .map(|m| m.to_string())
+                .collect(),
+            // arboard exposes pixels: this backend syncs PNG only.
+            BackendPlan::Polling => vec!["image/png".to_string()],
+        }
+    }
 }
 
 /// Decide which backend runs, given the config override, the session, and
@@ -335,7 +349,10 @@ mod gui_tests {
         loop {
             let remaining = deadline.checked_duration_since(Instant::now())?;
             match rx.recv_timeout(remaining) {
-                Ok(ev) if ev.text == want => return Some(ev),
+                Ok(ev) if matches!(&ev.content, crate::engine::ClipboardContent::Text(t) if t == want) =>
+                {
+                    return Some(ev);
+                }
                 Ok(_) => continue,
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
             }

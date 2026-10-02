@@ -543,12 +543,14 @@ class MainActivity : Activity() {
             row.timeMs, now, DateUtils.MINUTE_IN_MILLIS
         ).toString()
         timeView.text = timeText
-        sizeView.text = UiFormat.humanSize(row.bytes)
+        val sizeText = UiFormat.humanSize(row.bytes)
+        sizeView.text = if (row.isImage) getString(R.string.activity_image_size, sizeText) else sizeText
         glyphView.setImageResource(if (row.ok) R.drawable.ic_check else R.drawable.ic_cross)
         glyphView.imageTintList = tintFor(if (row.ok) R.attr.clipStatusOk else R.attr.clipStatusError)
         val label = getString(labelRes)
         val outcome = if (row.ok) "succeeded" else "failed"
-        rowView.contentDescription = "$label $timeText, ${UiFormat.talkSize(row.bytes)}, $outcome"
+        val kind = if (row.isImage) "image, " else ""
+        rowView.contentDescription = "$label $timeText, $kind${UiFormat.talkSize(row.bytes)}, $outcome"
         if (row.detail != null) {
             detailView.visibility = View.VISIBLE
             detailView.text = row.detail
@@ -591,6 +593,18 @@ class MainActivity : Activity() {
     // --- send flow --------------------------------------------------------
 
     private fun sendClipboardNow() {
+        // An image in the clipboard wins over text (it is the richer
+        // representation); the button label stays "Send clipboard now".
+        val image = currentClipboardImage()
+        if (image != null) {
+            sendImageNow(image, quiet = false)
+            return
+        }
+        if (hasImageMime()) {
+            // An image is present but unreadable or over the sync limit.
+            showTransientReason(getString(R.string.send_image_too_large))
+            return
+        }
         val text = currentClipboardTextForSend() ?: ClipboardHelper.getText(this)
         if (text.isNullOrEmpty()) {
             showTransientReason(getString(R.string.send_empty))
@@ -625,16 +639,20 @@ class MainActivity : Activity() {
         if (event.success) {
             sentFlashUntil = nowMs() + SENT_FLASH_MS
             transientReason = null
-            sendButton.text = getString(
-                R.string.send_sent, UiFormat.humanSize(event.length.toLong())
-            )
+            val size = UiFormat.humanSize(event.length.toLong())
+            sendButton.text = if (event.isImage) {
+                getString(R.string.send_sent_image, size)
+            } else {
+                getString(R.string.send_sent, size)
+            }
             sendButton.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
             scheduleSentRestore()
             renderSend(lastScreen ?: return, nowMs())
         } else {
             sentFlashUntil = 0
             showTransientReason(
-                if (event.tooLarge) getString(R.string.toast_too_large, event.length)
+                if (event.tooLarge && event.isImage) getString(R.string.send_image_too_large)
+                else if (event.tooLarge) getString(R.string.toast_too_large, event.length)
                 else getString(R.string.toast_sent_fail)
             )
         }
@@ -700,19 +718,74 @@ class MainActivity : Activity() {
 
     private fun autoSendClipboard() {
         if (clipboardManager == null) return
-        considerAutoSend(currentClipboardText())
+        considerAutoSend()
     }
 
     private fun pollClipboardOnResume() {
         if (clipboardManager == null) return
-        val text = currentClipboardText() ?: return
-        val hash = ClipboardHelper.contentHash(text)
-        if (hash == lastSeenHash) return
-        considerAutoSend(text)
+        if (currentContentHash() == lastSeenHash) return
+        considerAutoSend()
+    }
+
+    /** Hash of whatever is sendable right now (image bytes win over text). */
+    private fun currentContentHash(): String? {
+        currentClipboardImage()?.let { return ClipboardHelper.contentHashBytes(it.bytes) }
+        return currentClipboardText()?.let { ClipboardHelper.contentHash(it) }
+    }
+
+    /** Current clipboard image within the sync limit, or null. */
+    private fun currentClipboardImage(): ClipboardHelper.ImageContent? {
+        return try {
+            ClipboardHelper.getImage(
+                this, com.clipcast.protocol.LargeTextLimits.MAX_IMAGE_BYTES
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** True when the clip offers a supported image MIME type (even if over-limit). */
+    private fun hasImageMime(): Boolean {
+        val cm = clipboardManager
+            ?: getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        if (!cm.hasPrimaryClip()) return false
+        val desc = cm.primaryClip?.description ?: return false
+        val mimes = Array(desc.mimeTypeCount) { desc.getMimeType(it) }
+        return ClipboardHelper.preferredImageMime(mimes) != null
     }
 
     /** Shared quiet-send core for the listener and the resume poll. */
-    private fun considerAutoSend(text: String?) {
+    private fun considerAutoSend() {
+        val image = currentClipboardImage()
+        if (image != null) {
+            considerAutoSendImage(image)
+            return
+        }
+        considerAutoSendText(currentClipboardText())
+    }
+
+    private fun considerAutoSendImage(image: ClipboardHelper.ImageContent) {
+        if (image.bytes.size.toLong() >
+            com.clipcast.protocol.LargeTextLimits.MAX_IMAGE_BYTES
+        ) {
+            // Quiet send: oversize auto-sends stay silent (no toast storm).
+            return
+        }
+        val now = System.currentTimeMillis()
+        val hash = ClipboardHelper.contentHashBytes(image.bytes)
+        if (lastAutoSentHash != null && now - lastAutoSentTime < 2000 &&
+            hash == lastAutoSentHash
+        ) {
+            return
+        }
+        lastAutoSentHash = hash
+        lastAutoSentTime = now
+        lastSeenHash = hash
+        sendImageNow(image, quiet = true)
+    }
+
+    /** Shared quiet-send core for text (unchanged behavior). */
+    private fun considerAutoSendText(text: String?) {
         if (text.isNullOrEmpty()) return
         if (text.toByteArray(Charsets.UTF_8).size >
             com.clipcast.protocol.LargeTextLimits.DEFAULT_MAX_SEND_BYTES
@@ -733,6 +806,31 @@ class MainActivity : Activity() {
                 putExtra(ClipcastService.EXTRA_QUIET, true)
             }
         )
+    }
+
+    /**
+     * Stage image bytes where the service can read them (Binder cannot
+     * carry megabytes in intent extras) and ask the service to announce.
+     * The service deletes the staging file after reading it.
+     */
+    private fun sendImageNow(image: ClipboardHelper.ImageContent, quiet: Boolean) {
+        val staged = ClipboardHelper.stageImageForSend(this, image)
+        if (staged == null) {
+            if (!quiet) showTransientReason(getString(R.string.toast_sent_fail))
+            return
+        }
+        lastSeenHash = ClipboardHelper.contentHashBytes(image.bytes)
+        transientReason = null
+
+        startService(
+            Intent(this, ClipcastService::class.java).apply {
+                action = ClipcastService.ACTION_SEND_CLIPBOARD
+                putExtra(ClipcastService.EXTRA_IMAGE_PATH, staged)
+                putExtra(ClipcastService.EXTRA_IMAGE_MIME, image.mimeType)
+                putExtra(ClipcastService.EXTRA_QUIET, quiet)
+            }
+        )
+        // No toast: Android 12+ already shows its own clipboard-access notice.
     }
 
     // --- small helpers -----------------------------------------------------

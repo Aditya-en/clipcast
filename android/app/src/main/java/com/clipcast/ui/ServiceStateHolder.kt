@@ -28,6 +28,10 @@ object ServiceStateHolder {
         val lastRxLen: Int = 0,
         val lastTxTime: Long = 0,
         val lastTxLen: Int = 0,
+        /** Last received item was an image (size in lastRxLen). */
+        val lastRxIsImage: Boolean = false,
+        /** Last sent item was an image (size in lastTxLen). */
+        val lastTxIsImage: Boolean = false,
         /** Last fetch outcome in plain service wording, or "none". */
         val lastTransfer: String = "none",
         /** Outcome of the most recent send (survives rotation). */
@@ -42,7 +46,9 @@ object ServiceStateHolder {
         /** Bytes sent (char length as before, display only). */
         val length: Int,
         val quiet: Boolean,
-        val tooLarge: Boolean
+        val tooLarge: Boolean,
+        /** Sent item was an image ("Sent · Image · 2.4 MB"). */
+        val isImage: Boolean = false
     )
 
     fun interface StateListener {

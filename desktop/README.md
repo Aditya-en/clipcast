@@ -135,7 +135,7 @@ content_type = `0x80` and this 59-byte payload (all integers big-endian):
 
 | size | field              | notes                                    |
 |-----:|--------------------|------------------------------------------|
-|    1 | inner_content_type | `0x01` = text/plain UTF-8 (others: ignore the announce; reserved for images/files later) |
+|    1 | inner_content_type | `0x01` = text/plain UTF-8; `0x02` = image (payload gains a MIME suffix, § Image sync); other values: ignore the announce |
 |   16 | transfer_id        | random per transfer                      |
 |    8 | total_len          | plaintext bytes (u64)                    |
 |   32 | sha256             | SHA-256 of the plaintext content bytes   |
@@ -201,6 +201,46 @@ Byte-exact vectors for a fixed key/ids/nonce/payload (announce payload,
 header, session key, handshake tag, first and final frames) are in
 `docs/test-vectors-v2.md`, asserted by a unit test.
 
+## Image sync
+
+Copying an image syncs it the same way large text syncs — UDP stays the
+control plane, image bytes never touch a UDP datagram:
+
+1. The clipboard backend reports an image (`image/png`, `image/jpeg`, or
+   `image/webp`; the image wins when several representations exist).
+2. The daemon stores the bytes in `~/.local/state/clipcast/images/` (files
+   `0600`, kept `image_cache_ttl_secs`, at most `max_cached_images`) and
+   hashes them.
+3. It broadcasts one UDP image announce (content_type `0x80`, inner `0x02`,
+   plus a MIME suffix — old clients see a wrong-length payload and ignore
+   it).
+4. Receivers run the same ordering check, fetch over the same TCP channel,
+   verify length + SHA-256, confirm the update is still current (a newer
+   text/image that arrived mid-download wins; the stale image is dropped),
+   and publish the image to the local clipboard. Echo suppression is by
+   content hash, so a received image is never rebroadcast.
+5. Publish normalization: received JPEGs are transcoded to PNG before
+   they reach the local clipboard, because some paste targets
+   (notably Chromium-based browsers) silently ignore JPEG clipboard
+   content while accepting PNG — regardless of which peer offered it.
+   The wire bytes, hashes, and sender cache are untouched; only the
+   locally published copy is PNG, and echo suppression follows the
+   published bytes. Undecodable JPEGs, and transcoded PNGs that would
+   exceed `max_image_bytes`, fall back to the original bytes (best
+   effort, logged).
+
+Oversize images (`max_image_bytes`, default 16 MiB) are logged by MIME type
+and size only, never sent. The exact byte layout is specified in
+[`docs/protocol.md`](docs/protocol.md); deterministic vectors are in
+[`docs/test-vectors-image.md`](docs/test-vectors-image.md).
+
+Backend notes: X11 reads/serves the native `image/png`/`image/jpeg`/
+`image/webp` selection targets (INCR transfers are skipped, never
+partially synced). Wayland reads/serves the same MIME types through
+data-control. The polling fallback syncs PNG only (arboard exposes raw
+pixels, encoded/decoded with the `png` crate) — JPEG/WebP copied under
+the polling backend are left alone.
+
 ## Security model and limits — read this
 
 - **No forward secrecy.** One long-term symmetric key encrypts everything,
@@ -223,6 +263,12 @@ header, session key, handshake tag, first and final frames) are in
   fetch of content the sender still holds).
 - **Key compromise is total compromise.** Anyone holding the key can read
   and inject clipboard content on your LAN, forever, for that key.
+- Images are encrypted with the same shared key: every peer holding the
+  key can decrypt clipboard images as well as text. Image sizes and timing
+  remain visible as metadata, and sent images sit temporarily in
+  `~/.local/state/clipcast/images/` (0600 files, 10-minute TTL by
+  default) so peers can fetch them — never retained indefinitely, but
+  present on disk while fetchable.
 - Clipboard content never appears in logs by default (only length and a
   short hash prefix). `--log-content` disables that protection — debug use
   only.
@@ -234,11 +280,9 @@ header, session key, handshake tag, first and final frames) are in
   `x-kde-passwordManagerHint` with value `secret`, it is not broadcast
   (`skip_sensitive = true`, default). The polling backend cannot see MIME
   types, so it cannot detect this — one more reason it is a fallback.
-- v1 syncs plain text only. Images, files, rich text are out of scope;
-  `0x02` (image) is reserved and ignored. Large text uses the v2
-  announce + TCP fetch above; the inner content-type field leaves room for
-  images/files later. No compression, no resumable transfers, no relays,
-  no TLS.
+- v1 syncs plain text inline; larger text and images use the v2
+  announce + TCP fetch above. No compression, no resumable transfers, no
+  relays, no TLS.
 
 ## Configuration
 
@@ -252,6 +296,9 @@ max_transfer_bytes = 67108864  # 64 MiB: larger local text is never sent
 tcp_port = 47475        # large-text TCP listener + advertised port
 transfer_ttl_secs = 120 # pending transfers stay fetchable this long
 fetch_timeout_secs = 120# overall cap for one incoming TCP fetch
+max_image_bytes = 16777216  # 16 MiB: larger images are never sent/fetched
+image_cache_ttl_secs = 600  # sent images stay fetchable this long
+max_cached_images = 20      # sender image cache cap (oldest evicted)
 poll_interval_ms = 300     # polling backend only
 skip_sensitive = true
 backend = "auto"           # "auto" | "x11" | "wayland" | "polling"
@@ -370,14 +417,20 @@ installed elsewhere.
 
 `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`
 are clean. Unit tests cover proto round-trip and malformed input (v1 + v2
-announce), crypto tampering, both documented test-vector files, HKDF
-(RFC 5869 case 1), TCP frame sealing/opening and reassembly violations
-(truncated stream, missing FINAL, data after FINAL, wrong length/hash),
-silent-drop of unauthenticated TCP connections, the transfer store
-caps/TTL/budgets, engine behaviors (a)–(h) against fakes (large-text
-announce, exactly-one-fetch, apply-without-rebroadcast, stale/duplicate
-suppression, fetch cancellation, over-limit and same-hash skips, failed
-fetch applies nothing), interface discovery/filtering, UDP loopback with
+announce + image announce), crypto tampering, all three documented
+test-vector files, HKDF (RFC 5869 case 1), TCP frame sealing/opening and
+reassembly violations (truncated stream, missing FINAL, data after FINAL,
+wrong length/hash), silent-drop of unauthenticated TCP connections, the
+transfer store caps/TTL/budgets, the disk image cache (round-trip, expiry,
+eviction, permissions, unknown ids), PNG encode/decode for the polling
+backend, engine behaviors (a)–(h) against fakes (large-text announce,
+exactly-one-fetch, apply-without-rebroadcast, stale/duplicate suppression,
+fetch cancellation, over-limit and same-hash skips, failed fetch applies
+nothing) plus image engine behaviors (exactly-one-announce,
+fetchable-before-announce, loopback apply-once-without-rebroadcast,
+duplicate-announce dedup, older-image drop, own-device ignore, newer-text-
+wins race, corrupt-image rejection, over-limit skips, fetch-cap
+cancel-newest-wins), interface discovery/filtering, UDP loopback with
 source capture, config/keys/paths, backend planning, MIME/hint parsing.
 
 Integration tests (`clipboard::gui_tests`) run against the real session:
