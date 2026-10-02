@@ -15,6 +15,7 @@ pub mod config;
 pub mod crypto;
 pub mod doctor;
 pub mod engine;
+pub mod fetch;
 pub mod keys;
 pub mod net;
 pub mod paths;
