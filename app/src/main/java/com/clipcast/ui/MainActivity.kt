@@ -1,60 +1,83 @@
 package com.clipcast.ui
 
 import android.app.Activity
-import android.content.BroadcastReceiver
+import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.TextUtils
-import android.util.Base64
+import android.text.format.DateUtils
+import android.transition.Fade
+import android.transition.TransitionManager
+import android.view.HapticFeedbackConstants
 import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
-import android.widget.CompoundButton
-import android.widget.EditText
+import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.Switch
 import android.widget.TextView
-import android.widget.Toast
-import com.clipcast.service.ClipcastService
 import com.clipcast.R
-import com.clipcast.protocol.Crypto
-import com.clipcast.protocol.LargeTextLimits
+import com.clipcast.service.ClipcastService
 import com.clipcast.util.ClipboardHelper
 import com.clipcast.util.Preferences
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
+/**
+ * Main screen: "is it working?" at a glance + one primary action.
+ * Everything set-once lives in SettingsActivity. Observes service state
+ * through ServiceStateHolder (updates only while visible). Never shows
+ * clipboard content anywhere: sizes and times only.
+ */
 class MainActivity : Activity() {
+
+    companion object {
+        /** SettingsActivity scrolls to/highlights the key field. */
+        const val EXTRA_SCROLL_TO_KEY = "extra_scroll_to_key"
+        private const val SENT_FLASH_MS = 2000L
+        private const val COPIED_MS = 1500L
+    }
+
     private var preferences: Preferences? = null
     private var stateListener: ServiceStateHolder.StateListener? = null
     private var sendListener: ServiceStateHolder.SendListener? = null
+    private var lastScreen: StatusMapper.MainScreen? = null
 
-    private lateinit var deviceIdValue: TextView
-    private lateinit var keyInput: EditText
-    private lateinit var portInput: EditText
-    private lateinit var tcpPortInput: EditText
-    private lateinit var maxApplyInput: EditText
-    private lateinit var autostartCheck: CompoundButton
+    private lateinit var statusCard: View
+    private lateinit var statusDot: View
+    private lateinit var statusTitle: TextView
+    private lateinit var statusSub: TextView
     private lateinit var serviceSwitch: Switch
-    private lateinit var statusText: TextView
-    private lateinit var lastRxText: TextView
-    private lateinit var lastTxText: TextView
-    private lateinit var tcpStatusText: TextView
-    private lateinit var lastTransferText: TextView
-    private lateinit var sendNowButton: Button
+    private lateinit var emptyView: TextView
+    private lateinit var rowReceived: View
+    private lateinit var receivedTime: TextView
+    private lateinit var receivedSize: TextView
+    private lateinit var receivedGlyph: ImageView
+    private lateinit var detailReceived: TextView
+    private lateinit var rowSent: View
+    private lateinit var sentTime: TextView
+    private lateinit var sentSize: TextView
+    private lateinit var sentGlyph: ImageView
+    private lateinit var detailSent: TextView
+    private lateinit var sendButton: Button
+    private lateinit var sendReason: TextView
 
-    private val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    private var updatingSwitch = false
+    private var transientReason: String? = null
+    private var sentFlashUntil: Long = 0
+    private var copiedUntil: Long = 0
+    private var currentIpLine: String? = null
+    private var statusTappable = false
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var sentRestore: Runnable? = null
+    private var copiedRestore: Runnable? = null
 
-    // Foreground-only auto-send (path a): Android 10+ blocks background
-    // clipboard reads, so the listener is active only while resumed, plus we
-    // snapshot on pause and re-check on resume to catch copies made in other
-    // apps while we were away.
+    // Foreground-only auto-send: Android 10+ blocks background clipboard
+    // reads, so the listener is active only while resumed, plus we snapshot
+    // on pause and re-check on resume.
     private var clipboardManager: ClipboardManager? = null
     private var lastAutoSentHash: String? = null
     private var lastAutoSentTime: Long = 0
@@ -62,7 +85,6 @@ class MainActivity : Activity() {
     private val debounceHandler = Handler(Looper.getMainLooper())
     private var pendingDebounce: Runnable? = null
     private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
-        // Trailing-edge debounce: coalesce rapid successive copies, send once.
         pendingDebounce?.let { debounceHandler.removeCallbacks(it) }
         val task = Runnable { autoSendClipboard() }
         pendingDebounce = task
@@ -76,129 +98,103 @@ class MainActivity : Activity() {
 
         preferences = Preferences.getInstance(this)
 
-        deviceIdValue = findViewById(R.id.deviceIdValue)
-        keyInput = findViewById(R.id.keyInput)
-        portInput = findViewById(R.id.portInput)
-        tcpPortInput = findViewById(R.id.tcpPortInput)
-        maxApplyInput = findViewById(R.id.maxApplyInput)
-        autostartCheck = findViewById(R.id.autostartCheck)
+        statusCard = findViewById(R.id.statusCard)
+        statusDot = findViewById(R.id.statusDot)
+        statusTitle = findViewById(R.id.statusTitle)
+        statusSub = findViewById(R.id.statusSub)
         serviceSwitch = findViewById(R.id.serviceSwitch)
-        statusText = findViewById(R.id.statusText)
-        lastRxText = findViewById(R.id.lastRxText)
-        lastTxText = findViewById(R.id.lastTxText)
-        tcpStatusText = findViewById(R.id.tcpStatusText)
-        lastTransferText = findViewById(R.id.lastTransferText)
-        sendNowButton = findViewById(R.id.sendNowButton)
+        emptyView = findViewById(R.id.emptyView)
+        rowReceived = findViewById(R.id.rowReceived)
+        receivedTime = findViewById(R.id.receivedTime)
+        receivedSize = findViewById(R.id.receivedSize)
+        receivedGlyph = findViewById(R.id.receivedGlyph)
+        detailReceived = findViewById(R.id.detailReceived)
+        rowSent = findViewById(R.id.rowSent)
+        sentTime = findViewById(R.id.sentTime)
+        sentSize = findViewById(R.id.sentSize)
+        sentGlyph = findViewById(R.id.sentGlyph)
+        detailSent = findViewById(R.id.detailSent)
+        sendButton = findViewById(R.id.sendButton)
+        sendReason = findViewById(R.id.sendReason)
 
-        deviceIdValue.text = "Device ID: ${Crypto.bytesToHex(preferences?.deviceId ?: ByteArray(16))}"
-
-        keyInput.setText(preferences?.encryptionKey ?: "")
-        portInput.setText(preferences?.port.toString())
-        tcpPortInput.setText((preferences?.tcpPort ?: LargeTextLimits.DEFAULT_TCP_PORT).toString())
-        maxApplyInput.setText(((preferences?.maxApplyBytes ?: LargeTextLimits.DEFAULT_MAX_APPLY_BYTES) / 1024).toString())
-        autostartCheck.isChecked = preferences?.autostart ?: false
-
+        serviceSwitch.contentDescription = getString(R.string.status_off)
         serviceSwitch.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingSwitch) return@setOnCheckedChangeListener
+            transientReason = null
             if (isChecked) {
-                validateAndStart()
+                turnSyncOn()
             } else {
                 stopService()
             }
         }
 
-        sendNowButton.setOnClickListener {
+        findViewById<ImageButton>(R.id.settingsButton).setOnClickListener {
+            openSettings(scrollToKey = false)
+        }
+        statusCard.setOnClickListener {
+            if (statusTappable) openSettings(scrollToKey = true)
+        }
+        statusSub.setOnClickListener {
+            currentIpLine?.let { copyIp(it) }
+        }
+        sendButton.setOnClickListener {
             sendClipboardNow()
         }
 
-        autostartCheck.setOnCheckedChangeListener { _, isChecked ->
-            preferences?.autostart = isChecked
-            updateBootReceiver(isChecked)
+        if (savedInstanceState != null) {
+            transientReason = savedInstanceState.getString("transientReason")
+            sentFlashUntil = savedInstanceState.getLong("sentFlashUntil")
+            copiedUntil = savedInstanceState.getLong("copiedUntil")
         }
 
         stateListener = ServiceStateHolder.StateListener { snapshot ->
-            updateStatusUI(snapshot)
+            render(StatusMapper.map(snapshot))
         }
         sendListener = ServiceStateHolder.SendListener { event ->
-            // Quiet (auto-send) results only update the status line, no toast.
-            if (event.quiet) return@SendListener
-            if (event.success) {
-                Toast.makeText(this@MainActivity, getString(R.string.toast_sent, event.length), Toast.LENGTH_SHORT).show()
-            } else if (event.tooLarge) {
-                Toast.makeText(this@MainActivity, getString(R.string.toast_too_large, event.length), Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this@MainActivity, R.string.toast_sent_fail, Toast.LENGTH_SHORT).show()
-            }
+            if (!event.quiet) onSendEvent(event)
         }
-        ServiceStateHolder.addStateListener(stateListener!!)
-        ServiceStateHolder.addSendListener(sendListener!!)
     }
 
     override fun onResume() {
         super.onResume()
-        requestStatusBroadcast()
-        // Foreground auto-send on: we can read the clipboard while resumed.
+        ServiceStateHolder.addStateListener(stateListener!!)
+        ServiceStateHolder.addSendListener(sendListener!!)
+        requestStatusRefresh()
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboardManager?.addPrimaryClipChangedListener(clipListener)
-        // Catch copies made in other apps while we were paused: if the
-        // clipboard differs from what we last saw, sync it now.
         pollClipboardOnResume()
     }
 
     override fun onPause() {
-        // Snapshot so onResume can detect changes made while away.
         lastSeenHash = currentClipboardText()?.let { ClipboardHelper.contentHash(it) }
         clipboardManager?.removePrimaryClipChangedListener(clipListener)
         clipboardManager = null
         pendingDebounce?.let { debounceHandler.removeCallbacks(it) }
         pendingDebounce = null
+        stateListener?.let { ServiceStateHolder.removeStateListener(it) }
+        sendListener?.let { ServiceStateHolder.removeSendListener(it) }
+        sentRestore?.let { uiHandler.removeCallbacks(it) }
+        copiedRestore?.let { uiHandler.removeCallbacks(it) }
         super.onPause()
     }
 
-    override fun onDestroy() {
-        stateListener?.let { ServiceStateHolder.removeStateListener(it) }
-        sendListener?.let { ServiceStateHolder.removeSendListener(it) }
-        super.onDestroy()
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString("transientReason", transientReason)
+        outState.putLong("sentFlashUntil", sentFlashUntil)
+        outState.putLong("copiedUntil", copiedUntil)
     }
 
-    private fun validateAndStart() {
-        val key = keyInput.text.toString().trim()
-        val portStr = portInput.text.toString().trim()
-        val tcpPortStr = tcpPortInput.text.toString().trim()
-        val maxApplyStr = maxApplyInput.text.toString().trim()
+    // --- sync control -----------------------------------------------------
 
-        if (TextUtils.isEmpty(key) || !Crypto.validateKey(key)) {
-            Toast.makeText(this, R.string.toast_key_invalid, Toast.LENGTH_LONG).show()
-            serviceSwitch.isChecked = false
+    private fun turnSyncOn() {
+        if (preferences?.isConfigured() != true) {
+            // No key yet: send them to Settings instead of starting.
+            setSwitchChecked(false)
+            openSettings(scrollToKey = true)
             return
         }
-
-        val port = portStr.toIntOrNull() ?: 47474
-        if (port < 1 || port > 65535) {
-            Toast.makeText(this, "Invalid port", Toast.LENGTH_SHORT).show()
-            serviceSwitch.isChecked = false
-            return
-        }
-
-        val tcpPort = tcpPortStr.toIntOrNull() ?: LargeTextLimits.DEFAULT_TCP_PORT
-        if (tcpPort < 1 || tcpPort > 65535) {
-            Toast.makeText(this, "Invalid TCP port", Toast.LENGTH_SHORT).show()
-            serviceSwitch.isChecked = false
-            return
-        }
-
-        val maxApplyKiB = maxApplyStr.toIntOrNull()
-            ?: (LargeTextLimits.DEFAULT_MAX_APPLY_BYTES / 1024)
-        if (maxApplyKiB < 0 || maxApplyKiB > LargeTextLimits.MAX_APPLY_HARD_CAP / 1024) {
-            Toast.makeText(this, "Max applied text must be 0–900 KiB", Toast.LENGTH_SHORT).show()
-            serviceSwitch.isChecked = false
-            return
-        }
-
-        preferences?.encryptionKey = key
-        preferences?.port = port
-        preferences?.tcpPort = tcpPort
-        preferences?.maxApplyBytes = maxApplyKiB * 1024
-
+        // Notification-permission request lands here in M4; until then start.
         startService()
     }
 
@@ -206,10 +202,8 @@ class MainActivity : Activity() {
         val intent = Intent(this, ClipcastService::class.java).apply {
             action = ClipcastService.ACTION_START
         }
-        // minSdk 26: startForegroundService always available.
         startForegroundService(intent)
-        serviceSwitch.isChecked = true
-        statusText.text = getString(R.string.status_starting)
+        setSwitchChecked(true)
     }
 
     private fun stopService() {
@@ -217,28 +211,296 @@ class MainActivity : Activity() {
             action = ClipcastService.ACTION_STOP
         }
         startService(intent)
-        serviceSwitch.isChecked = false
+        setSwitchChecked(false)
     }
 
-    private fun sendClipboardNow() {
-        val text = ClipboardHelper.getText(this)
-        if (text.isNullOrEmpty()) {
-            Toast.makeText(this, getString(R.string.toast_empty), Toast.LENGTH_SHORT).show()
+    private fun setSwitchChecked(checked: Boolean) {
+        updatingSwitch = true
+        serviceSwitch.isChecked = checked
+        updatingSwitch = false
+    }
+
+    private fun openSettings(scrollToKey: Boolean) {
+        startActivity(
+            Intent(this, SettingsActivity::class.java).apply {
+                putExtra(EXTRA_SCROLL_TO_KEY, scrollToKey)
+            }
+        )
+    }
+
+    private fun requestStatusRefresh() {
+        try {
+            startService(
+                Intent(this, ClipcastService::class.java).apply {
+                    action = ClipcastService.ACTION_QUERY_STATUS
+                }
+            )
+        } catch (e: Exception) {
+            // Service not running yet; holder replay covers the defaults.
+        }
+    }
+
+    // --- rendering --------------------------------------------------------
+
+    private fun render(screen: StatusMapper.MainScreen) {
+        lastScreen = screen
+        val now = System.currentTimeMillis()
+
+        if (animatorsEnabled()) {
+            TransitionManager.beginDelayedTransition(statusCard as ViewGroup, Fade())
+        }
+        renderStatus(screen)
+        renderActivity(screen, now)
+        renderSend(screen, now)
+    }
+
+    private fun renderStatus(screen: StatusMapper.MainScreen) {
+        statusTappable = screen.statusTappable
+        statusCard.isClickable = screen.statusTappable
+        statusCard.isFocusable = screen.statusTappable
+        statusCard.foreground = if (screen.statusTappable) {
+            val ripple = obtainStyledAttributes(
+                intArrayOf(android.R.attr.selectableItemBackground)
+            )
+            val drawable = ripple.getDrawable(0)
+            ripple.recycle()
+            drawable
+        } else {
+            null
+        }
+        when (val st = screen.status) {
+            is StatusMapper.MainStatus.On -> {
+                tintDot(R.attr.clipStatusOk)
+                statusTitle.setText(R.string.status_on)
+                currentIpLine = st.ipLine?.substringBefore(" · ")
+                if (st.ipLine != null) {
+                    statusSub.visibility = View.VISIBLE
+                    statusSub.text = st.ipLine
+                    statusSub.setTypeface(android.graphics.Typeface.MONOSPACE)
+                } else {
+                    statusSub.visibility = View.GONE
+                }
+            }
+            is StatusMapper.MainStatus.Off -> {
+                tintDotSecondary()
+                statusTitle.setText(R.string.status_off)
+                statusSub.visibility = View.GONE
+                currentIpLine = null
+            }
+            is StatusMapper.MainStatus.WaitingWifi -> {
+                tintDot(R.attr.clipStatusWarn)
+                statusTitle.setText(R.string.status_waiting_wifi)
+                statusSub.visibility = View.GONE
+                currentIpLine = null
+            }
+            is StatusMapper.MainStatus.NeedsSetup -> {
+                tintDot(R.attr.clipStatusWarn)
+                statusTitle.setText(R.string.status_needs_setup)
+                statusSub.visibility = View.VISIBLE
+                statusSub.text = getString(R.string.status_sub_no_key)
+                statusSub.setTypeface(android.graphics.Typeface.DEFAULT)
+                currentIpLine = null
+            }
+            is StatusMapper.MainStatus.Error -> {
+                tintDot(R.attr.clipStatusError)
+                statusTitle.text = st.reason
+                statusSub.visibility = View.VISIBLE
+                statusSub.text = getString(R.string.status_fix_in_settings)
+                statusSub.setTypeface(android.graphics.Typeface.DEFAULT)
+                currentIpLine = null
+            }
+        }
+        // "Copied" feedback rides on the sub line; restore it below.
+        if (nowMs() < copiedUntil && currentIpLine != null) {
+            showCopiedFeedback()
+        }
+        setSwitchChecked(ServiceStateHolder.last.running)
+        serviceSwitch.contentDescription = if (ServiceStateHolder.last.running) {
+            getString(R.string.status_on)
+        } else {
+            getString(R.string.status_off)
+        }
+    }
+
+    private fun renderActivity(screen: StatusMapper.MainScreen, now: Long) {
+        if (screen.empty) {
+            emptyView.visibility = View.VISIBLE
+            rowReceived.visibility = View.GONE
+            detailReceived.visibility = View.GONE
+            rowSent.visibility = View.GONE
+            detailSent.visibility = View.GONE
             return
         }
-        if (text.toByteArray(Charsets.UTF_8).size > LargeTextLimits.DEFAULT_MAX_SEND_BYTES) {
-            Toast.makeText(this, getString(R.string.toast_too_large, text.length), Toast.LENGTH_SHORT).show()
+        emptyView.visibility = View.GONE
+        renderRow(
+            screen.received, rowReceived, receivedTime, receivedSize,
+            receivedGlyph, detailReceived, now, R.string.activity_received
+        )
+        renderRow(
+            screen.sent, rowSent, sentTime, sentSize,
+            sentGlyph, detailSent, now, R.string.activity_sent
+        )
+    }
+
+    private fun renderRow(
+        row: StatusMapper.ActivityRow?,
+        rowView: View,
+        timeView: TextView,
+        sizeView: TextView,
+        glyphView: ImageView,
+        detailView: TextView,
+        now: Long,
+        labelRes: Int
+    ) {
+        if (row == null) {
+            rowView.visibility = View.GONE
+            detailView.visibility = View.GONE
+            return
+        }
+        rowView.visibility = View.VISIBLE
+        val timeText = DateUtils.getRelativeTimeSpanString(
+            row.timeMs, now, DateUtils.MINUTE_IN_MILLIS
+        ).toString()
+        timeView.text = timeText
+        sizeView.text = UiFormat.humanSize(row.bytes)
+        glyphView.setImageResource(if (row.ok) R.drawable.ic_check else R.drawable.ic_cross)
+        glyphView.imageTintList = tintFor(if (row.ok) R.attr.clipStatusOk else R.attr.clipStatusError)
+        val label = getString(labelRes)
+        val outcome = if (row.ok) "succeeded" else "failed"
+        rowView.contentDescription = "$label $timeText, ${UiFormat.talkSize(row.bytes)}, $outcome"
+        if (row.detail != null) {
+            detailView.visibility = View.VISIBLE
+            detailView.text = row.detail
+        } else {
+            detailView.visibility = View.GONE
+        }
+    }
+
+    private fun renderSend(screen: StatusMapper.MainScreen, now: Long) {
+        sendButton.isEnabled = screen.sendEnabled
+        if (now < sentFlashUntil) {
+            // Keep the brief "Sent" state; the restore runnable resets it.
+            scheduleSentRestore()
+        } else {
+            sendButton.setText(R.string.btn_send_now)
+        }
+        val reason = transientReason ?: when {
+            !screen.sendEnabled -> reasonFor(screen.sendReason)
+            else -> null
+        }
+        if (reason != null) {
+            sendReason.visibility = View.VISIBLE
+            sendReason.text = reason
+        } else {
+            sendReason.visibility = View.GONE
+        }
+    }
+
+    private fun reasonFor(mapped: String?): String? {
+        // Mapper strings are already resource-free plain words; resolve the
+        // two disabled cases to localized text.
+        if (mapped == null) return null
+        return when (mapped) {
+            "Add your key in Settings to send" -> getString(R.string.send_reason_no_key)
+            "Turn sync on to send" -> getString(R.string.send_reason_off)
+            else -> mapped
+        }
+    }
+
+    // --- send flow --------------------------------------------------------
+
+    private fun sendClipboardNow() {
+        val text = currentClipboardTextForSend() ?: ClipboardHelper.getText(this)
+        if (text.isNullOrEmpty()) {
+            showTransientReason(getString(R.string.send_empty))
+            return
+        }
+        if (text.toByteArray(Charsets.UTF_8).size > com.clipcast.protocol.LargeTextLimits.DEFAULT_MAX_SEND_BYTES) {
+            showTransientReason(getString(R.string.toast_too_large, text.length))
             return
         }
         lastSeenHash = ClipboardHelper.contentHash(text)
+        transientReason = null
 
-        val intent = Intent(this, ClipcastService::class.java).apply {
-            action = ClipcastService.ACTION_SEND_CLIPBOARD
-            putExtra(ClipcastService.EXTRA_TEXT, text)
-            putExtra(ClipcastService.EXTRA_QUIET, false)
-        }
-        startService(intent)
+        startService(
+            Intent(this, ClipcastService::class.java).apply {
+                action = ClipcastService.ACTION_SEND_CLIPBOARD
+                putExtra(ClipcastService.EXTRA_TEXT, text)
+                putExtra(ClipcastService.EXTRA_QUIET, false)
+            }
+        )
+        // No toast: Android 12+ already shows its own clipboard-access notice.
     }
+
+    /**
+     * Reads the clipboard through the resumed listener path when possible so
+     * sensitive-clip filtering stays in one place.
+     */
+    private fun currentClipboardTextForSend(): String? {
+        return if (clipboardManager != null) currentClipboardText() else null
+    }
+
+    private fun onSendEvent(event: ServiceStateHolder.SendEvent) {
+        if (event.success) {
+            sentFlashUntil = nowMs() + SENT_FLASH_MS
+            transientReason = null
+            sendButton.text = getString(
+                R.string.send_sent, UiFormat.humanSize(event.length.toLong())
+            )
+            sendButton.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            scheduleSentRestore()
+            renderSend(lastScreen ?: return, nowMs())
+        } else {
+            sentFlashUntil = 0
+            showTransientReason(
+                if (event.tooLarge) getString(R.string.toast_too_large, event.length)
+                else getString(R.string.toast_sent_fail)
+            )
+        }
+    }
+
+    private fun scheduleSentRestore() {
+        sentRestore?.let { uiHandler.removeCallbacks(it) }
+        val task = Runnable {
+            sentFlashUntil = 0
+            sendButton.setText(R.string.btn_send_now)
+            lastScreen?.let { renderSend(it, nowMs()) }
+        }
+        sentRestore = task
+        uiHandler.postDelayed(task, SENT_FLASH_MS)
+    }
+
+    private fun showTransientReason(reason: String) {
+        transientReason = reason
+        lastScreen?.let { renderSend(it, nowMs()) }
+    }
+
+    private fun copyIp(ip: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("clipcast ip", ip))
+        // Don't auto-send our own copy: mark it seen on every path.
+        val hash = ClipboardHelper.contentHash(ip)
+        lastSeenHash = hash
+        lastAutoSentHash = hash
+        lastAutoSentTime = nowMs()
+        copiedUntil = nowMs() + COPIED_MS
+        showCopiedFeedback()
+        copiedRestore?.let { uiHandler.removeCallbacks(it) }
+        val task = Runnable {
+            copiedUntil = 0
+            lastScreen?.let { renderStatus(it) }
+        }
+        copiedRestore = task
+        uiHandler.postDelayed(task, COPIED_MS)
+    }
+
+    private fun showCopiedFeedback() {
+        statusSub.visibility = View.VISIBLE
+        statusSub.text = getString(R.string.copied)
+        statusSub.setTypeface(android.graphics.Typeface.DEFAULT)
+    }
+
+    // --- clipboard auto-send (unchanged behavior) --------------------------
 
     /** Readable plain-text of the current primary clip, or null. */
     private fun currentClipboardText(): String? {
@@ -255,106 +517,64 @@ class MainActivity : Activity() {
         return clip.getItemAt(0).coerceToText(this)?.toString()
     }
 
-    /**
-     * Foreground auto-send: fires on every clipboard change while the
-     * activity is resumed. Quiet (no toast); oversize still warns.
-     * The service drops echoes of just-applied remote content.
-     */
     private fun autoSendClipboard() {
         if (clipboardManager == null) return
-        considerAutoSend(currentClipboardText(), warnOversize = true)
+        considerAutoSend(currentClipboardText())
     }
 
-    /**
-     * Catches copies made in other apps while we were paused: sync on return
-     * if the clipboard differs from what we last saw. (True background
-     * sending is impossible on Android 10+; this is the closest equivalent.)
-     */
     private fun pollClipboardOnResume() {
         if (clipboardManager == null) return
         val text = currentClipboardText() ?: return
         val hash = ClipboardHelper.contentHash(text)
         if (hash == lastSeenHash) return
-        considerAutoSend(text, warnOversize = true)
+        considerAutoSend(text)
     }
 
     /** Shared quiet-send core for the listener and the resume poll. */
-    private fun considerAutoSend(text: String?, warnOversize: Boolean) {
+    private fun considerAutoSend(text: String?) {
         if (text.isNullOrEmpty()) return
-        // Small text goes over UDP as before; large text (up to 16 MiB) goes
-        // over the TCP side channel. Only beyond that do we warn.
-        if (text.toByteArray(Charsets.UTF_8).size > LargeTextLimits.DEFAULT_MAX_SEND_BYTES) {
-            if (warnOversize) {
-                Toast.makeText(this, getString(R.string.toast_too_large, text.length), Toast.LENGTH_SHORT).show()
-            }
+        if (text.toByteArray(Charsets.UTF_8).size >
+            com.clipcast.protocol.LargeTextLimits.DEFAULT_MAX_SEND_BYTES
+        ) {
+            // Quiet send: oversize auto-sends stay silent (no toast storm).
             return
         }
-        // Skip repeats of what we just sent (e.g. our own setPrimaryClip echo).
         val now = System.currentTimeMillis()
         if (!ClipboardHelper.shouldAutoSend(text, lastAutoSentHash, lastAutoSentTime, now)) return
         lastAutoSentHash = ClipboardHelper.contentHash(text)
         lastAutoSentTime = now
         lastSeenHash = lastAutoSentHash
 
-        val intent = Intent(this, ClipcastService::class.java).apply {
-            action = ClipcastService.ACTION_SEND_CLIPBOARD
-            putExtra(ClipcastService.EXTRA_TEXT, text)
-            putExtra(ClipcastService.EXTRA_QUIET, true)
-        }
-        startService(intent)
-    }
-
-    private fun requestStatusBroadcast() {
-        val intent = Intent(this, ClipcastService::class.java).apply {
-            action = ClipcastService.ACTION_QUERY_STATUS
-        }
-        try {
-            startService(intent)
-        } catch (e: Exception) {
-            // Service not running yet; status stays at defaults.
-        }
-    }
-
-    private fun updateStatusUI(s: ServiceStateHolder.Snapshot) {
-        if (s.running) {
-            serviceSwitch.isChecked = true
-            statusText.text = getString(R.string.status_running, s.localIp ?: "…", preferences?.port ?: 47474)
-        } else {
-            serviceSwitch.isChecked = false
-            statusText.text = if (!s.wifiConnected) {
-                getString(R.string.status_no_wifi)
-            } else {
-                getString(R.string.status_stopped)
+        startService(
+            Intent(this, ClipcastService::class.java).apply {
+                action = ClipcastService.ACTION_SEND_CLIPBOARD
+                putExtra(ClipcastService.EXTRA_TEXT, text)
+                putExtra(ClipcastService.EXTRA_QUIET, true)
             }
-        }
-
-        lastRxText.text = if (s.lastRxTime > 0) {
-            getString(R.string.last_rx, dateFormat.format(Date(s.lastRxTime)), s.lastRxLen)
-        } else {
-            getString(R.string.last_rx, getString(R.string.never), 0)
-        }
-
-        lastTxText.text = if (s.lastTxTime > 0) {
-            getString(R.string.last_tx, dateFormat.format(Date(s.lastTxTime)), s.lastTxLen)
-        } else {
-            getString(R.string.last_tx, getString(R.string.never), 0)
-        }
-
-        // TCP listener state and last transfer result (size + outcome only).
-        tcpStatusText.text = getString(
-            R.string.tcp_listening,
-            if (!s.running) "TCP stopped" else s.tcpError ?: "TCP listening"
         )
-        lastTransferText.text = getString(R.string.last_transfer, s.lastTransfer)
     }
 
-    private fun updateBootReceiver(enabled: Boolean) {
-        val componentName = android.content.ComponentName(this, com.clipcast.receiver.BootReceiver::class.java)
-        val newState = if (enabled) {
-            android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-        } else {
-            android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-        }
-        packageManager.setComponentEnabledSetting(componentName, newState, android.content.pm.PackageManager.DONT_KILL_APP)
+    // --- small helpers -----------------------------------------------------
+
+    private fun nowMs(): Long = System.currentTimeMillis()
+
+    private fun animatorsEnabled(): Boolean {
+        return android.animation.ValueAnimator.areAnimatorsEnabled()
+    }
+
+    private fun tintDot(attr: Int) {
+        statusDot.backgroundTintList = tintFor(attr)
+    }
+
+    private fun tintDotSecondary() {
+        val out = android.util.TypedValue()
+        theme.resolveAttribute(android.R.attr.textColorSecondary, out, true)
+        statusDot.backgroundTintList = android.content.res.ColorStateList.valueOf(out.data)
+    }
+
+    private fun tintFor(attr: Int): android.content.res.ColorStateList {
+        val out = android.util.TypedValue()
+        theme.resolveAttribute(attr, out, true)
+        return android.content.res.ColorStateList.valueOf(out.data)
     }
 }

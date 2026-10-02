@@ -32,6 +32,13 @@
         </activity>
 
         <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="false"
+            android:label="@string/title_settings"
+            android:parentActivityName=".ui.MainActivity"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
             android:name=".ui.SendActivity"
             android:exported="true"
             android:theme="@style/Theme.Clipcast.Transparent"
